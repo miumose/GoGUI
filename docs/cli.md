@@ -213,8 +213,7 @@ to the configuration.
 
 Checks the development machine: Go, Bun and the webview of the platform,
 which projects with a web frontend need, and the tools of optional
-features: NSIS for Windows installers (which `mygo build` downloads on
-Windows), `signtool` or `osslsigncode` for signing Windows apps, `gh` for
+features: `signtool` or `osslsigncode` for signing Windows apps, `gh` for
 `-upload`, and Developer ID identities for signing macOS apps.
 
 ## mygo version

@@ -53,9 +53,6 @@ jobs:
           go-version-file: go.mod
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - name: Install NSIS, for the Windows installers
-        if: matrix.name == 'Windows' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nsis
       - name: Build and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,7 +84,7 @@ git push origin v1.2.0
 
 The draft release job creates the draft release `v1.2.0`. Then the build
 job runs once for each row of its matrix, at the same time, and each
-uploads to the draft: the macOS disk images, the Windows installers, and
+uploads to the draft: the macOS disk images, the portable update archives, and
 the Linux archives, Debian packages and install script, each with their
 updates.
 Review the draft and publish it: apps then update to it.
@@ -195,13 +192,13 @@ base64 -i code-signing.pfx | gh secret set WINDOWS_CERTIFICATE
 gh secret set WINDOWS_CERTIFICATE_PASSWORD
 ```
 
-For the Windows row, install `osslsigncode` with NSIS, write the
+For the Windows row, install `osslsigncode`, write the
 certificate to a file, and give its path and password to the build:
 
 ```yaml
-      - name: Install NSIS and osslsigncode
+      - name: Install osslsigncode
         if: matrix.name == 'Windows' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nsis osslsigncode
+        run: sudo apt-get update && sudo apt-get install -y osslsigncode
       - name: Write the certificate
         if: matrix.name == 'Windows'
         env:
@@ -223,8 +220,7 @@ export default defineConfig({
 });
 ```
 
-The first step replaces the one that installs NSIS. Builds on your
-machine, without the variable, are not signed.
+Builds on your machine, without the variable, are not signed.
 
 ### Signing on Windows
 
@@ -232,8 +228,7 @@ Certificates whose keys stay in a hardware token or a cloud service, such
 as Azure Trusted Signing, sign with `signCommand` (see
 [code signing](distribution.md#code-signing)), which often needs
 `signtool`. Build the Windows apps on a Windows runner then, which has
-`signtool`, and where `mygo build` downloads NSIS itself; the step that
-installs NSIS is for Linux runners only:
+`signtool`:
 
 ```yaml
           - { name: Windows, os: windows-latest, platform: "windows/amd64,windows/arm64" }
@@ -243,22 +238,7 @@ Sign in to the signing service in a step for the Windows row, before
 "Build and upload", as its documentation says. Steps run in PowerShell on
 Windows runners unless they set `shell: bash`.
 
-`mygo build` downloads NSIS on every run of a fresh runner. A step before
-"Build and upload" keeps it in the Actions cache instead, so builds need
-neither the download nor the hosts it comes from. The lockfile pins
-mygo-cli, which pins NSIS:
-
-```yaml
-      - name: Cache NSIS
-        if: runner.os == 'Windows'
-        uses: actions/cache@v6
-        with:
-          path: ~\AppData\Local\mygo\nsis-*
-          key: nsis-${{ hashFiles('bun.lock') }}
-```
-
-In a project of native UI, `go.mod` pins the CLI: key the cache on
-`hashFiles('go.sum')`.
+Windows builds are portable and need no NSIS installation or download cache.
 
 ## Checking the version
 
@@ -328,7 +308,7 @@ permission.
 ## Without a release
 
 Without `updates`, `-upload` has nowhere to upload to. Build without it and
-keep the installers as artifacts of the run, which works on every push too,
+keep the build outputs as artifacts of the run, which works on every push too,
 to check that the apps build:
 
 ```yaml
@@ -338,7 +318,7 @@ to check that the apps build:
           name: ${{ matrix.name }}
           path: |
             build/*/*.dmg
-            build/*/*Setup*.exe
+            build/windows-*/
             build/*/*.deb
             build/*/*.tar.gz
 ```

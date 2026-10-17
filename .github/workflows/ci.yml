@@ -60,8 +60,7 @@ jobs:
           go vet $(go list ./... | grep -v /cmd/mygo)
           go test -exec "$(go env GOROOT)/lib/wasm/go_js_wasm_exec" ./internal/web ./internal/gpu/gl
       # The plugins' tests load the native libraries their mygo-plugin.json
-      # pins, and on Windows the installer tests run the NSIS that
-      # internal/nsis pins, all of which they download into the user's cache
+      # pins, which they download into the user's cache
       # when it lacks them. Downloading them here, before the tests, and
       # keeping them in the Actions cache under a key of what pins them,
       # keeps the tests off the network and its hosts' passing failures.
@@ -71,8 +70,7 @@ jobs:
         with:
           path: |
             ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/natives
-            ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/nsis-*
-          key: downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('plugins/*/mygo-plugin.json', 'internal/nsis/nsis.go') }}
+          key: downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('plugins/*/mygo-plugin.json') }}
       - name: Download what the tests need
         run: go run ./internal/prefetch
       - name: Save the downloads of the tests
@@ -81,7 +79,6 @@ jobs:
         with:
           path: |
             ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/natives
-            ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/nsis-*
           key: ${{ steps.downloads.outputs.cache-primary-key }}
       - run: go test ./...
       - name: Test without the inspector, as production builds
@@ -130,8 +127,7 @@ jobs:
         with:
           path: |
             ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/natives
-            ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/nsis-*
-          key: downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('plugins/*/mygo-plugin.json', 'internal/nsis/nsis.go') }}
+          key: downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('plugins/*/mygo-plugin.json') }}
       - name: Download what the tests need
         run: go run ./internal/prefetch
       - name: Save the downloads of the tests
@@ -140,7 +136,6 @@ jobs:
         with:
           path: |
             ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/natives
-            ${{ runner.os == 'Windows' && '~/AppData/Local' || runner.os == 'macOS' && '~/Library/Caches' || '~/.cache' }}/mygo/nsis-*
           key: ${{ steps.downloads.outputs.cache-primary-key }}
       - run: go test ./...
       - name: Test without the inspector, as production builds

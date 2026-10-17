@@ -238,8 +238,7 @@ An app replaces itself, so it must be able to write where it is installed:
 
 - macOS: the app bundle, e.g. in `/Applications` for an administrator, or
   in the user's `~/Applications`.
-- Windows: the per-user install of the [installer](distribution.md#the-installer),
-  in `%LOCALAPPDATA%\Programs`.
+- Windows: the portable build extracted into a directory the user can write.
 - Linux: a directory of the user, such as `~/.local/my-app.app`, where
   [`install.sh`](distribution.md#the-install-script) installs the app, or
   the extracted build.

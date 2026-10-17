@@ -1,14 +1,13 @@
 // Command prefetch downloads into the user's cache what this repository's
 // tests otherwise download there while they run: the native libraries that
-// the plugins name in their mygo-plugin.json, for this platform, and on
-// Windows the NSIS that mygo build uses. CI runs it before `go test` and
-// keeps what it downloads in the Actions cache, under a key of the files
-// that pin them, so that the tests do not depend on the network:
+// the plugins name in their mygo-plugin.json, for this platform. CI runs
+// it before `go test` and keeps the downloads in the Actions cache, under
+// a key of the files that pin them, so the tests do not need the network:
 //
 //	go run ./internal/prefetch
 //
 // It downloads them where the plugins and the CLI look:
-// <cache>/mygo/natives/<sha256>/<name> and <cache>/mygo/nsis-<version>.
+// <cache>/mygo/natives/<sha256>/<name>.
 package main
 
 import (
@@ -21,7 +20,6 @@ import (
 	"runtime"
 
 	"github.com/egoist/mygo/internal/download"
-	"github.com/egoist/mygo/internal/nsis"
 )
 
 func main() {
@@ -70,12 +68,5 @@ func main() {
 			}
 			fmt.Printf("%s: %s\n", l.Name, path)
 		}
-	}
-	if runtime.GOOS == "windows" {
-		makensis, err := nsis.Download(ctx, nsis.Dir(), func(url string) download.File { return download.File{URL: url} })
-		if err != nil {
-			log.Fatalf("NSIS: %v", err)
-		}
-		fmt.Printf("NSIS %s: %s\n", nsis.Release.Version, makensis)
 	}
 }

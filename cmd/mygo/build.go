@@ -38,9 +38,9 @@ among them are signed with the app. Directories of resources named after a
 platform, such as resources/darwin or resources/linux-amd64, only ship with
 that platform's apps; darwin/universal combines darwin-arm64 and
 darwin-amd64. MyGo needs no cgo, so any platform can be compiled from any
-machine; signing and disk images need macOS. Windows also gets
-"<name> Setup <version> <arch>.exe", made with NSIS, which mygo build
-downloads on Windows when it is not installed.
+machine; signing and disk images need macOS. Windows builds a portable
+executable and its resources only; it does not create an installer or
+download installer tools.
 
 Set macos.signingIdentity in mygo.json (or -sign) to a Developer ID to ship
 outside the Mac App Store, and macos.notarize to notarize the disk image.
@@ -345,20 +345,6 @@ func buildPlatform(c *Config, goos, goarch string, opts buildOptions) ([]string,
 		}
 		for _, e := range all {
 			installed = append(installed, e.Name())
-		}
-	}
-	if goos == "windows" {
-		setup, err := writeInstaller(c, stage, opts.work, name+".exe", goarch, installed)
-		if err != nil {
-			return nil, err
-		}
-		if setup != "" {
-			if c.Windows.signs() {
-				if err := signWindows(c, setup); err != nil {
-					return nil, err
-				}
-			}
-			artifacts = append(artifacts, setup)
 		}
 	}
 	if _, ok := debArch[goarch]; goos == "linux" && ok {

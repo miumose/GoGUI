@@ -3575,39 +3575,11 @@ renderer's (`gputest.Compare`).
   directory is assembled in a staging directory that replaces it whole, so
   removed resources do not linger; development builds on Linux and Windows
   remove what the previous build placed and this one lacks.
-- Packages for the other platforms. Windows gets "<name> Setup
-  <version>.exe", made with NSIS (`nsis.go`): a per-user install in
-  `%LOCALAPPDATA%\Programs\<name>`, where the updater can write, a Start
-  menu shortcut, a desktop shortcut that the finish page's second check
-  box (MUI's "show readme" one) creates, and an uninstaller registered
-  under `HKCU\…\Uninstall\<identifier>`; `/S /D=<dir>` installs
-  silently, without the desktop shortcut. The uninstaller runs from a
-  copy of itself that nothing waits for, so it removes the app's folder
-  last: the folder is gone once the uninstall is done. It tries deleting
-  each shortcut again for up to 5 s, as Explorer opens a new shortcut a
-  few seconds after it appears, not sharing it for deletion, and `Delete`
-  fails meanwhile.
-  `makensis` comes from an installation of NSIS or, on Windows, where NSIS
-  is rarely installed, from the official zip of the release that
-  `Release` in `internal/nsis` pins, which the CLI downloads once, checks
-  against its SHA-256 and unpacks into `<user cache>/mygo`, as Tauri
-  does. It tries the copies of
-  the zip in `Release.URLs` in order, until one answers with the right
-  SHA-256: the asset of this repository's `nsis-<version>` release, then
-  SourceForge, where NSIS publishes it. SourceForge's download host has
-  been down for hours at a time, and its mirrors then redirect to it, so
-  it is not the only source; a host that sends no response headers within
-  30 s gives way to the next. Updating NSIS means publishing the copy (see
-  [Releasing](https://github.com/egoist/mygo/blob/main/docs/architecture.md#releasing)). Other systems skip the
-  installer without NSIS: its zip holds Windows programs only. A signed
-  app gets a signed uninstaller too, as with Tauri: `!uninstfinalize`
-  (NSIS 3.08 and later) makes makensis run `mygo sign-uninstaller` on the
-  uninstaller it generates, before it puts it into the installer, and the
-  CLI signs it as it signs the app. The executable and the Windows
-  configuration reach it through the environment (`MYGO_SIGNER`,
-  `MYGO_SIGN_SETTINGS`), since NSIS reads `$` in the script as its own
-  syntax. Linux
-  gets a Debian package written in pure Go (`deb.go`), whose maintainer
+- Packages for the other platforms. Windows gets the portable executable
+  and its resources only. `build` never calls the legacy installer helpers
+  in `nsis.go`, and the CLI no longer downloads NSIS. `doctor` does not
+  check for it and `internal/prefetch` downloads only plugin libraries.
+  Linux gets a Debian package written in pure Go (`deb.go`), whose maintainer
   is `linux.maintainer`, else the `author` of package.json, else the name
   of the app: the app in `/opt/<name>`, a `/usr/bin` link named
   `linux.command` when there is one, the desktop entry (categories,
@@ -3897,27 +3869,10 @@ for the tag and creates the GitHub release.
 
 It does not run the tests again: `ci.yml` runs them on every push to main,
 for every platform, GUI tests included, so tag a commit whose CI passed.
-Before the tests, each job downloads what they would download into the
-user's cache otherwise (`go run ./internal/prefetch`): the plugins'
-native libraries for its platform, and NSIS on Windows. It keeps them in
-the Actions cache, under a key of the files that pin them (the plugins'
-`mygo-plugin.json` and `internal/nsis/nsis.go`), so that the tests do
-not depend on the network.
-
-The NSIS that `mygo build` downloads (`Release` in `internal/nsis/nsis.go`)
-has a copy on a release of this repository, which a new version of NSIS
-needs before a MyGo release that pins it. Download the official zip,
-check that its SHA-256 is the one `Release` pins, and publish it,
-without making the release the latest:
-
-```sh
-curl -fLO https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip
-sha256sum nsis-3.13.zip
-gh release create nsis-3.13 nsis-3.13.zip --latest=false --title "NSIS 3.13" \
-  --notes "The official NSIS 3.13 zip, which mygo build downloads on Windows."
-```
-
-The tag starts no workflow, and the Go module proxy ignores it.
+Before the tests, each job downloads the plugins' native libraries for its
+platform into the user's cache (`go run ./internal/prefetch`). The Actions
+cache key follows the plugins' `mygo-plugin.json` files. Windows builds and
+CI do not download NSIS or produce Windows installers.
 
 npm authenticates the workflow as a trusted publisher of each package
 (`release.yml` of this repository, set in the package's settings on npm),

@@ -4,6 +4,17 @@
 
 **Desktop apps in Go, with native UI or a web frontend.**
 
+> GoGUI fork: Windows builds produce portable applications only. Automatic
+> installer creation and NSIS downloads are disabled.
+
+Use the CLI built from this checkout to get this behavior; an existing
+upstream `mygo-cli` installation is not changed by editing this repository.
+From the GoGUI directory, build a project with:
+
+```sh
+go run ./cmd/mygo build <project-directory>
+```
+
 Each MyGo window shows one of two kinds of interface, and one app, or one
 window, can mix them:
 
@@ -29,7 +40,7 @@ memory and CPU use.
 - **Desktop APIs** for both: windows, menus, tray, dialogs, notifications,
   global shortcuts, deep links, file associations, recent documents, the
   system accent color and accessibility settings, watching files, and more.
-- **Ready to ship**: app bundles and disk images, Windows installers, Debian
+- **Ready to ship**: app bundles and disk images, portable Windows executables, Debian
   packages and a Linux install script, code signing, notarization, and signed
   auto-updates with delta updates and an update window in the manner of
   Sparkle.

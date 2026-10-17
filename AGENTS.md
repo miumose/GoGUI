@@ -11,6 +11,10 @@ wire protocol, TypeScript generation, and the checklist for adding features.
 
 ## Hard rules
 
+- **Portable Windows builds.** `mygo build` produces the executable and its
+  resources only. Do not restore automatic Windows installer creation or
+  NSIS downloads/invocation in build, doctor, prefetch or CI. Keep
+  `TestWindowsPortableBuild` covering this behavior.
 - **No cgo.** Everything must build with `CGO_ENABLED=0`. Call native code
   through purego (`internal/darwin`, `internal/linux`) or `syscall`
   (`internal/windows`), never `import "C"`.

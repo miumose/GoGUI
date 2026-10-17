@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,9 +19,8 @@ import (
 // The Windows installer is built with NSIS: a per-user install in
 // %LOCALAPPDATA%\Programs, where the app can update itself, with a Start
 // menu shortcut, a desktop shortcut the finish page offers, and an
-// uninstaller that Settings > Apps lists. Windows rarely has NSIS
-// installed, so there mygo build downloads it when it needs it, as Tauri
-// and electron-builder do; elsewhere makensis must be installed.
+// uninstaller that Settings > Apps lists. These legacy helpers are not
+// called by GoGUI builds. NSIS is never downloaded automatically.
 
 // makensis finds the NSIS compiler: an installed one or, on Windows, the
 // one an earlier build downloaded.
@@ -44,32 +41,10 @@ func makensis() string {
 	return ""
 }
 
-// nsisCompiler returns the NSIS compiler, which it downloads on Windows
-// when there is none, or "" on other systems without NSIS.
+// nsisCompiler only finds an existing compiler for the legacy helpers.
+// GoGUI does not download NSIS, and build does not call these helpers.
 func nsisCompiler() (string, error) {
-	if p := makensis(); p != "" || runtime.GOOS != "windows" {
-		return p, nil
-	}
-	dir := nsis.Dir()
-	if dir == "" {
-		return "", errors.New("no cache directory to download NSIS into: install NSIS (makensis)")
-	}
-	return downloadNSIS(dir)
-}
-
-// downloadNSIS downloads nsis.Release into dir, unless it is there
-// already, and returns its makensis.
-func downloadNSIS(dir string) (string, error) {
-	if p := nsis.Executable(dir); p != "" {
-		return p, nil
-	}
-	v := nsis.Release.Version
-	t := con.start("Downloading NSIS " + v + " for the Windows installer")
-	p, err := nsis.Download(context.Background(), dir, func(url string) fetch.File { return downloadFile(t, url, "") })
-	if t.end(err, "Downloaded NSIS "+v) != nil {
-		return "", fmt.Errorf("downloading NSIS %s (or install it: https://nsis.sourceforge.io):\n%w", v, err)
-	}
-	return p, nil
+	return makensis(), nil
 }
 
 // downloadHeaderTimeout is how long the CLI's downloads wait for a host to

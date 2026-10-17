@@ -1,7 +1,7 @@
 # Building and distributing
 
 `mygo build` turns a project into apps people install: an app bundle and a
-disk image on macOS, an executable and an installer on Windows, an
+disk image on macOS, a portable executable on Windows, an
 executable, a desktop entry, an archive with its install script and a Debian
 package on Linux.
 
@@ -34,8 +34,7 @@ mygo build -platform darwin/universal,windows/amd64,windows/arm64,linux/amd64,li
 `darwin/universal` combines arm64 and amd64 in one app. MyGo needs no cgo,
 so any machine compiles for every platform. Some steps need the tools of a
 platform, and are skipped with a note elsewhere: macOS apps are signed and
-put in disk images on macOS only, and Windows installers are made on other
-systems only where [NSIS](#the-installer) is installed.
+put in disk images on macOS only. Windows builds need no installer tools.
 
 The CLI defaults to `CGO_ENABLED=0`. If an app's dependencies need cgo,
 set `CGO_ENABLED=1` in the environment for `mygo dev`, `mygo build` and
@@ -45,7 +44,7 @@ when cross-compiling, set `CC` to a suitable cross compiler.
 | Platform | In `build/<os>-<arch>/` |
 |---|---|
 | macOS | `My App.app`, signed, and `My App 0.1.0 arm64.dmg` (`My App 0.1.0.dmg` for `darwin/universal`) |
-| Windows | `My App.exe`, the files of the app, and the installer `My App Setup 0.1.0 amd64.exe` |
+| Windows | `My App.exe` and the files of the app (portable; no installer) |
 | Linux | `my-app`, `my-app.desktop`, `my-app.png`, `my-app.xml` for the file types the app defines, the files of the app, their archive `my-app-0.1.0-linux-amd64.tar.gz` with [`install.sh`](#the-install-script), and the Debian package `my-app_0.1.0_amd64.deb` |
 
 Other flags: `-debug` keeps development features such as the inspector,
@@ -369,29 +368,18 @@ window. A `.syso` file of your own in the main package replaces them.
 
 ### The installer
 
-`mygo build` also makes `My App Setup 1.2.0 amd64.exe`, named for its
-architecture as the disk images are, so that the installers of two
-targets, uploaded to one release, keep both. It installs the app for
-the current user in `%LOCALAPPDATA%\Programs\My App`, which needs no
-administrator rights and lets the app [update itself](updates.md), adds a
-Start menu shortcut and an uninstaller listed in Settings, and registers
-the app's URL schemes and file associations. Its last page offers to run
-the app and to create a desktop shortcut, which is checked; silent
-installs (`/S`) create none.
+GoGUI builds portable Windows apps only. `mygo build` creates the executable
+and its resources, without a Setup.exe or uninstaller. It does not search
+for, invoke or download NSIS, even when NSIS is already installed.
 
-The installer is made with [NSIS](https://nsis.sourceforge.io). On
-Windows, `mygo build` uses NSIS when it is installed, and otherwise
-downloads it the first time it needs it: the official NSIS 3.13 zip, from
-a copy on MyGo's GitHub releases or else from SourceForge, checked against
-its SHA-256 and kept in `%LOCALAPPDATA%\mygo`. On macOS and
-Linux, install NSIS to make Windows installers (`brew install makensis`,
-`apt install nsis`); without it, `mygo build` skips the installer.
+Run the executable from its output directory, keeping any resources beside
+it. The build does not create shortcuts, register file associations or URL
+schemes, or add an entry to Windows Settings for uninstalling the app.
 
 ### Code signing
 
-Unsigned apps make SmartScreen warn users. Sign the executable, the
-[helper executables](#helper-executables), the installer and its
-uninstaller with a certificate:
+Unsigned apps make SmartScreen warn users. Sign the executable and the
+[helper executables](#helper-executables) with a certificate:
 
 ```ts
 export default defineConfig({
@@ -496,10 +484,7 @@ its source language first, which the system falls back to:
   language the app shows, and System Settings lists the app's languages.
 - Linux: `Name[xx]` and `Comment[xx]` in the desktop entry, by POSIX
   locale (`de`, `zh_CN`, `zh_TW`, `sr@latin`).
-- Windows: the installer is in each of the languages, and picks the
-  system's; NSIS 3 has files of some 60 languages, and a language it has
-  none of stops the build, saying which it has. The file properties have a
-  table of strings per language.
+- Windows: the executable file properties have a table of strings per language.
 
 The app's name and description in a language are its catalog's
 `mygo.appName` and `mygo.appDescription`; the configuration's `name` and
@@ -526,9 +511,9 @@ property list in XML.
 
 `urlSchemes` and `fileAssociations` in the configuration (see
 [deep links](app.md#deep-links) and [file associations](app.md#file-associations))
-are registered by each package: in the macOS app's `Info.plist`, by the
-Windows installer, and by the Linux desktop entry, install script and
-Debian package.
+are registered in the macOS app's `Info.plist` and by the Linux desktop
+entry, install script and Debian package. Portable Windows builds do not
+register them automatically.
 
 ## Publishing
 
