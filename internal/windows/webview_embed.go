@@ -324,7 +324,7 @@ func (w *window) placeEmbedded() {
 	if w.shown {
 		putBounds(w.controller, rect{int32(fx), int32(fy), int32(px(w.frame.X + w.frame.W)), int32(px(w.frame.Y + w.frame.H))})
 	}
-	comCall(w.controller, ctlPutIsVisible, boolArg(w.shown))
+	comCall(w.controller, ctlPutIsVisible, boolArg(w.shown && !w.host.unseen))
 }
 
 // webViewAt returns the web view that takes the pointer at x, y in the

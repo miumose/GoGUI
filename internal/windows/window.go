@@ -76,7 +76,8 @@ type window struct {
 		style, exStyle uintptr
 		placement      windowPlacement
 	}
-	state       int // last sizeRestored, sizeMinimized or sizeMaximized
+	state       int  // last sizeRestored, sizeMinimized or sizeMaximized
+	unseen      bool // hidden or minimized: WebView2 stops drawing its web views
 	opacity     float64
 	bgBrush     uintptr
 	bg          *platform.Color
@@ -351,6 +352,10 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 		procKillTimer.Call(w.hwnd, timerWebView)
 		w.createWebView()
 		return 0, true
+	case wmShowWindow:
+		iconic, _, _ := procIsIconic.Call(w.hwnd)
+		w.setUnseen(wp == 0 || iconic != 0)
+		return 0, false
 	case wmSize:
 		if !w.reframing { // SetFullScreen lays the window out once it is done
 			w.sized(wp)
@@ -452,6 +457,8 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 // sized lays the window out after it changed size or state (a WM_SIZE kind),
 // and tells the app.
 func (w *window) sized(kind uintptr) {
+	visible, _, _ := procIsWindowVisible.Call(w.hwnd)
+	w.setUnseen(kind == sizeMinimized || visible == 0)
 	w.resizeWebView()
 	if w.surface != nil {
 		w.surface.fit()
@@ -483,6 +490,24 @@ func (w *window) sized(kind uintptr) {
 		w.state = sizeRestored
 	}
 	w.h.Resized()
+}
+
+// setUnseen tells WebView2 whether the window's web views are visible, so
+// that a hidden or minimized window's pages stop drawing (their animations,
+// requestAnimationFrame) and see document.visibilityState "hidden".
+func (w *window) setUnseen(unseen bool) {
+	if w.unseen == unseen {
+		return
+	}
+	w.unseen = unseen
+	if w.controller != 0 && w.host == nil {
+		comCall(w.controller, ctlPutIsVisible, boolArg(!unseen))
+	}
+	for _, v := range w.webViews {
+		if v.controller != 0 {
+			comCall(v.controller, ctlPutIsVisible, boolArg(v.shown && !unseen))
+		}
+	}
 }
 
 // captionless reports a window without a caption: frameless, or with a

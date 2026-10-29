@@ -279,7 +279,11 @@ func (w *window) setUp(controller uintptr) {
 			l.commit()
 		}
 	} else {
-		comCall(controller, ctlPutIsVisible, 1)
+		// A window made hidden had no WM_SHOWWINDOW yet: ask it.
+		visible, _, _ := procIsWindowVisible.Call(w.hwnd)
+		iconic, _, _ := procIsIconic.Call(w.hwnd)
+		w.unseen = visible == 0 || iconic != 0
+		comCall(controller, ctlPutIsVisible, boolArg(!w.unseen))
 		w.resizeWebView()
 	}
 	if w.caption != nil {
