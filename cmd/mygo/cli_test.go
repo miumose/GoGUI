@@ -21,7 +21,7 @@ func TestConfigDefaults(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "frontend"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "frontend", "package.json"), []byte("{}"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "frontend", "package.json"), []byte(`{"dependencies": {"mygo-runtime": "^1"}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	c, err := loadConfig(dir)
@@ -57,13 +57,21 @@ func TestConfigDefaults(t *testing.T) {
 		t.Errorf("invalid devUrl accepted: %v", err)
 	}
 
-	// A frontend at the project root.
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if c, err := loadConfig(root); err != nil || c.Bindings != filepath.Join("src", "mygo.ts") {
-		t.Errorf("bindings with package.json at the root = %q, %v", c.Bindings, err)
+	// A frontend at the project root, and a package.json that is not one:
+	// it does not depend on mygo-runtime, which the client imports.
+	for _, tc := range []struct{ pkg, want string }{
+		{`{"dependencies": {"mygo-runtime": "^1"}}`, filepath.Join("src", "mygo.ts")},
+		{`{"devDependencies": {"mygo-runtime": "workspace:*"}}`, filepath.Join("src", "mygo.ts")},
+		{`{"devDependencies": {"mygo-cli": "^1"}}`, ""},
+		{`{}`, ""},
+	} {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(tc.pkg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := loadConfig(root); err != nil || c.Bindings != tc.want {
+			t.Errorf("bindings with package.json %s at the root = %q, %v; want %q", tc.pkg, c.Bindings, err, tc.want)
+		}
 	}
 }
 
@@ -234,9 +242,6 @@ func TestTemplate(t *testing.T) {
 			}
 		}
 	}
-	if slugify("Hello, World!") != "hello-world" || slugify("!!!") != "app" {
-		t.Error("slugify")
-	}
 }
 
 func TestTemplateSkills(t *testing.T) {
@@ -328,6 +333,17 @@ func TestModuleSpecifier(t *testing.T) {
 	}
 }
 
+func TestExtraLDFlags(t *testing.T) {
+	t.Setenv("MYGO_LDFLAGS", "")
+	if f := extraLDFlags(); f != "" {
+		t.Errorf("extraLDFlags = %q without MYGO_LDFLAGS", f)
+	}
+	t.Setenv("MYGO_LDFLAGS", " -buildid= -X example.com/app.DSN=https://key@example.com/1 ")
+	if f, want := extraLDFlags(), " -buildid= -X example.com/app.DSN=https://key@example.com/1"; f != want {
+		t.Errorf("extraLDFlags = %q, want %q", f, want)
+	}
+}
+
 func TestPackageFlags(t *testing.T) {
 	c := &Config{Name: "Bob's App", Version: "1.0.0", Identifier: "com.example.bob", URLSchemes: []string{"bob", "bob-dev"}}
 	got := packageFlags(c)
@@ -374,7 +390,7 @@ func TestProductionTags(t *testing.T) {
 	t.Setenv("GOFLAGS", "")
 	t.Setenv("MYGO_INSPECTOR", "")
 	tags := func(debug bool) string { return strings.Join(productionTags(debug), " ") }
-	if got := tags(false); got != "-tags mygo_noinspector" {
+	if got := tags(false); got != "-tags mygo_nodownload,mygo_noinspector" {
 		t.Errorf("a production build has %q", got)
 	}
 	if got := tags(true); got != "" {
@@ -382,11 +398,11 @@ func TestProductionTags(t *testing.T) {
 	}
 	// The tags of GOFLAGS stay: -tags would override them.
 	t.Setenv("GOFLAGS", "-mod=mod -tags=sqlite,fts5")
-	if got := tags(false); got != "-tags sqlite,fts5,mygo_noinspector" {
+	if got := tags(false); got != "-tags sqlite,fts5,mygo_nodownload,mygo_noinspector" {
 		t.Errorf("with GOFLAGS' tags, a production build has %q", got)
 	}
 	t.Setenv("MYGO_INSPECTOR", "1")
-	if got := tags(false); got != "" {
+	if got := tags(false); got != "-tags sqlite,fts5,mygo_nodownload" {
 		t.Errorf("MYGO_INSPECTOR=1 leaves %q", got)
 	}
 }
@@ -524,8 +540,8 @@ func TestSignWindowsResources(t *testing.T) {
 			t.Errorf("%s signed: %v, want %v", name, got, want)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bin", ".hidden.dll")); err == nil {
-		t.Error("a hidden file was copied")
+	if b, err := os.ReadFile(filepath.Join(dir, "bin", ".hidden.dll")); err != nil || !bytes.HasSuffix(b, []byte("signed")) {
+		t.Errorf("a dotfile resource was not copied and signed: %q, %v", b, err)
 	}
 	c.Windows.SignCommand = "false %1"
 	if err := signWindowsResources(c, dir, res); err == nil {
@@ -538,6 +554,7 @@ func TestFileAssociations(t *testing.T) {
 		FileAssociations: []FileAssociation{
 			{Ext: []string{"md", "markdown"}, Name: "Markdown Document", MimeType: "text/markdown"},
 			{Ext: []string{"note"}, Name: "Note", Role: "Viewer"},
+			{Ext: []string{"sketch"}, Name: "Sketch", MimeType: "application/x-notes-sketch"},
 		}}
 	plist := string(infoPlist(c, "Notes", "", ""))
 	for _, want := range []string{"<key>CFBundleDocumentTypes</key>", "<string>Markdown Document</string>", "<string>markdown</string>", "<string>Viewer</string>", "<string>text/markdown</string>"} {
@@ -546,11 +563,12 @@ func TestFileAssociations(t *testing.T) {
 		}
 	}
 	entry := linuxDesktopEntry(c, "notes", "notes")
-	if !strings.Contains(entry, "Exec=notes %U\n") || !strings.Contains(entry, "MimeType=text/markdown;application/x-notes-note;x-scheme-handler/notes;\n") {
+	if !strings.Contains(entry, "Exec=notes %U\n") || !strings.Contains(entry, "MimeType=text/markdown;application/x-notes-note;application/x-notes-sketch;x-scheme-handler/notes;\n") {
 		t.Errorf("desktop entry:\n%s", entry)
 	}
 	xml := mimePackage(c)
-	if !strings.Contains(xml, `<mime-type type="application/x-notes-note">`) || !strings.Contains(xml, `<glob pattern="*.note"/>`) || strings.Contains(xml, "text/markdown") {
+	if !strings.Contains(xml, `<mime-type type="application/x-notes-note">`) || !strings.Contains(xml, `<glob pattern="*.note"/>`) || strings.Contains(xml, "text/markdown") ||
+		!strings.Contains(xml, "<mime-type type=\"application/x-notes-sketch\">\n    <comment>Sketch</comment>\n    <glob pattern=\"*.sketch\"/>") {
 		t.Errorf("MIME package:\n%s", xml)
 	}
 	reg, unreg := nsisAssociations(c, "Notes.exe")
@@ -568,6 +586,36 @@ func TestFileAssociations(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "mygo.json"), []byte(`{"fileAssociations": `+bad+`}`), 0o644)
 		if _, err := loadConfig(dir); err == nil {
 			t.Errorf("accepted fileAssociations %s", bad)
+		}
+	}
+}
+
+// TestDesktopEntryStartupWMClass: an X11 session groups the app's window
+// with its entry through StartupWMClass, which names the program, not the
+// arguments of Exec that a file association adds.
+func TestDesktopEntryStartupWMClass(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mime  bool
+		want  string
+		notIn string
+	}{
+		{"notes", false, "StartupWMClass=notes\n", ""},
+		{"notes", true, "StartupWMClass=notes\n", "StartupWMClass=notes %U"},
+		// The Debian package and the PKGBUILD run the app from /opt: the
+		// window class is still the basename.
+		{"/opt/notes/notes", false, "StartupWMClass=notes\n", "StartupWMClass=/opt/notes/notes"},
+	} {
+		c := &Config{Name: "Notes", Identifier: "com.example.notes", Version: "1.0.0"}
+		if tc.mime {
+			c.FileAssociations = []FileAssociation{{Ext: []string{"md"}, Name: "Markdown", MimeType: "text/markdown"}}
+		}
+		entry := linuxDesktopEntry(c, tc.name, tc.name)
+		if !strings.Contains(entry, tc.want) {
+			t.Errorf("desktop entry lacks %q:\n%s", tc.want, entry)
+		}
+		if tc.notIn != "" && strings.Contains(entry, tc.notIn) {
+			t.Errorf("desktop entry has %q:\n%s", tc.notIn, entry)
 		}
 	}
 }
@@ -663,5 +711,33 @@ func TestAssetCatalog(t *testing.T) {
 	}
 	if car == nil || len(car.data) == 0 || !bytes.HasPrefix(car.icns, []byte("icns")) {
 		t.Errorf("catalog of Mark.icon = %+v", car)
+	}
+}
+
+// TestICNSIcon bundles macos.icon's .icns as it is, in place of the one
+// rendered from icon, and adds no asset catalog.
+func TestICNSIcon(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{"icon.png": string(defaultIcon()), "App.icns": "icns drawn per size", "Bad.icns": "png"})
+	c := &Config{Name: "Icns", Identifier: "com.example.icns", Version: "1.0.0", Icon: "icon.png", root: dir, MacOS: MacOS{Icon: "App.icns"}}
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	car, err := appCatalog(c)
+	if err != nil || car != nil {
+		t.Fatalf("catalog of App.icns = %+v, %v", car, err)
+	}
+	icns, err := bundleICNS(c, car)
+	if err != nil || string(icns) != "icns drawn per size" {
+		t.Errorf("bundle .icns = %q, %v", icns, err)
+	}
+	c.MacOS.Icon = "Bad.icns"
+	if _, err := bundleICNS(c, nil); err == nil {
+		t.Error("bundled an .icns that is not one")
+	}
+	c.MacOS.Icon = ""
+	if icns, err := bundleICNS(c, nil); err != nil || !bytes.HasPrefix(icns, []byte("icns")) || string(icns) == "icns drawn per size" {
+		t.Errorf("without macos.icon, the .icns is not icon's rendering: %v", err)
 	}
 }

@@ -26,6 +26,11 @@ func activateMenu(w *mygo.Window, path ...string) (err error) {
 	return err
 }
 
+func menuItemEnabled(_ *mygo.Window, path ...string) (enabled bool, err error) {
+	mygo.RunOnMain(func() { enabled, err = darwin.TestMenuItemEnabled(path...) })
+	return enabled, err
+}
+
 func pressShortcut(key string, shift bool) (handled bool, supported bool) {
 	mygo.RunOnMain(func() { handled = darwin.TestPerformKeyEquivalent(key, shift) })
 	return handled, true
@@ -41,6 +46,9 @@ func click(w *mygo.Window, x, y float64) bool {
 	mygo.RunOnMain(func() { darwin.TestClick(w.NativeHandle(), x, y) })
 	return true
 }
+
+// clickPage clicks a window's page: click reaches web views too.
+func clickPage(w *mygo.Window, x, y float64) bool { return click(w, x, y) }
 
 // appClick clicks through the application, whose event monitors see it.
 func appClick(w *mygo.Window, x, y float64) bool {
@@ -80,9 +88,27 @@ func sideButton(w *mygo.Window, back bool) (ok bool) {
 	return ok
 }
 
+// pinch pinches the touchpad at (x, y) by scale, and returns the scale
+// the platform reports.
+func pinch(w *mygo.Window, x, y, scale float64) (got float64, ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestPinch(w.NativeHandle(), x, y, scale-1) })
+	return scale, ok
+}
+
 func drag(w *mygo.Window, points [][2]float64) bool {
 	mygo.RunOnMain(func() { darwin.TestDrag(w.NativeHandle(), points) })
 	return true
+}
+
+// wheel turns the wheel at (x, y) of a window's content, through the
+// window's own hit testing.
+// The wheel over a web view is covered by internal/darwin's
+// TestEmbeddedWebViewScrollReachesSurface, with AppKit's events.
+func wheel(*mygo.Window, float64, float64) bool { return false }
+
+func hitView(w *mygo.Window, x, y float64) (class string) {
+	mygo.RunOnMain(func() { class = darwin.TestHitView(w.NativeHandle(), x, y) })
+	return class
 }
 
 func webViewAttached(w *mygo.Window) (attached bool, supported bool) {
@@ -103,6 +129,29 @@ func appActive() (active bool, supported bool) {
 func collectionBehavior(w *mygo.Window) (behavior uint, supported bool) {
 	mygo.RunOnMain(func() { behavior = darwin.TestCollectionBehavior(w.NativeHandle()) })
 	return behavior, true
+}
+
+func material(w *mygo.Window) (class string, style int, radius float64, active bool, supported bool) {
+	mygo.RunOnMain(func() { class, style, radius, active = darwin.TestMaterial(w.NativeHandle()) })
+	return class, style, radius, active, true
+}
+
+// materialState returns the NSVisualEffectState of the window's material.
+func materialState(w *mygo.Window) (state int, supported bool) {
+	mygo.RunOnMain(func() { state = darwin.TestMaterialState(w.NativeHandle()) })
+	return state, true
+}
+
+func roundedBacking(w *mygo.Window) (opaque bool, alpha, red float64, supported bool) {
+	mygo.RunOnMain(func() { opaque, alpha, red = darwin.TestRoundedBacking(w.NativeHandle()) })
+	return opaque, alpha, red, true
+}
+
+// windowBacking reports whether the window is opaque, and the alpha of its
+// background color.
+func windowBacking(w *mygo.Window) (opaque bool, alpha float64, supported bool) {
+	mygo.RunOnMain(func() { opaque, alpha = darwin.TestWindowBacking(w.NativeHandle()) })
+	return opaque, alpha, true
 }
 
 func dockDevTools(w *mygo.Window) (ok bool) {
@@ -181,6 +230,7 @@ func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return
 
 // AppKit composes the window: there is no redirection bitmap to go without.
 func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
+func canCompose() bool                            { return false }
 func loseComposition(bool) bool                   { return false }
 
 // WebKit creates web views with their windows.
@@ -209,6 +259,14 @@ func pressTab(w *mygo.Window, back bool) (ok bool) {
 	return ok
 }
 
+// pressKeyComposing presses a key in a window of native UI with the test
+// standing in for the input method: it commits commit, unless empty, then
+// passes the key on as command (doCommandBySelector:), unless empty.
+func pressKeyComposing(w *mygo.Window, code uint16, chars, commit, command string) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestKeyComposing(w.NativeHandle(), code, chars, commit, command) })
+	return ok
+}
+
 func compose(w *mygo.Window, text string, caret int, commit bool) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestCompose(w.NativeHandle(), text, caret, commit) })
 	return ok
@@ -217,6 +275,11 @@ func compose(w *mygo.Window, text string, caret int, commit bool) (ok bool) {
 func controlClick(w *mygo.Window, x, y float64) bool {
 	mygo.RunOnMain(func() { darwin.TestControlClick(w.NativeHandle(), x, y) })
 	return true
+}
+
+func secondaryClickAsPrimary(w *mygo.Window, x, y float64) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestSecondaryClickAsPrimary(w.NativeHandle(), x, y) })
+	return ok
 }
 
 func composeOver(w *mygo.Window, text string, caret int, commit bool, from, length int) (ok bool) {
@@ -286,6 +349,7 @@ func screenColor(*mygo.Window, float64, float64) (uint8, uint8, uint8, bool) { r
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+func popupItemEnabled(string) (bool, bool)           { return false, false }
 
 // pressEscape presses Escape in the key window, as the keyboard does.
 func pressEscape(*mygo.Window) bool {
@@ -310,3 +374,105 @@ func endSheetButton(w *mygo.Window, i int) (ok bool) {
 
 // Panels' window styles are Windows'.
 func panelStyles(*mygo.Window) (bool, bool, bool, bool) { return false, false, false, false }
+
+// throttlingOff reports whether the page of w, or of its first web view,
+// is set up to keep running while it can't be seen, and how many of the
+// settings that take the platform has.
+func throttlingOff(w *mygo.Window, webView bool) (off bool, settings int) {
+	mygo.RunOnMain(func() { off, settings = darwin.TestBackgroundThrottlingOff(w.NativeHandle(), webView) })
+	return off, settings
+}
+
+// mockCapture gives a window's page WebKit's mock camera and microphone.
+func mockCapture(w *mygo.Window) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestMockCaptureDevices(w.NativeHandle()) })
+	return ok
+}
+
+// pageGestures reports whether a swipe navigates and a pinch magnifies the
+// page of a window, or with webView 0 or more, of its web view of that
+// index.
+func pageGestures(w *mygo.Window, webView int) (swipe, pinch, ok bool) {
+	mygo.RunOnMain(func() { swipe, pinch, ok = darwin.TestPageGestures(w.NativeHandle(), webView) })
+	return swipe, pinch, ok
+}
+
+// A WKWebView's magnification follows a trackpad's gesture through its
+// phases, which a test can't make.
+func pinchPage(*mygo.Window, int, float64, float64, ...float64) bool { return false }
+
+// pageMenusHooked tells that the tests can right-click a page and read
+// the menu it opens, through rightClickPage, pageMenu, choosePageMenuItem
+// and dismissPageMenu.
+const pageMenusHooked = true
+
+// rightClickPage right-clicks (x, y) in a window's page.
+func rightClickPage(w *mygo.Window, x, y float64) bool {
+	waitOnScreen(w)
+	mygo.RunOnMain(func() { darwin.TestRightClickPage(w.NativeHandle(), x, y) })
+	return true
+}
+
+// pageMenu returns the titles of the items of the web view's context menu
+// shown over a page, "-" for separators, and whether one is shown. AppKit
+// tracks the menu in a loop of its own, which runs the main thread's work.
+func pageMenu() (labels []string, shown bool) {
+	mygo.RunOnMain(func() { labels, shown = darwin.TestPageMenu() })
+	return labels, shown
+}
+
+// choosePageMenuItem chooses an item of that menu by its title.
+func choosePageMenuItem(label string) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestChoosePageMenuItem(label) })
+	return ok
+}
+
+func dismissPageMenu() { mygo.RunOnMain(darwin.TestDismissPageMenu) }
+
+// Only Windows' tests start a process that takes the foreground.
+func takeForeground(*mygo.Window) {}
+
+// pressLetter presses the key of an uppercase letter, with Command held
+// when cmd is set, as the keyboard does in a window of native UI: in the
+// content, or in the page of a web view that has the keyboard.
+func pressLetter(w *mygo.Window, letter byte, cmd bool) (ok bool) {
+	code, known := map[byte]uint16{'J': 0x26, 'K': 0x28, 'L': 0x25}[letter]
+	if !known {
+		return false
+	}
+	chars := string(rune(letter - 'A' + 'a'))
+	mygo.RunOnMain(func() {
+		if cmd {
+			ok = darwin.TestKeyCmd(w.NativeHandle(), code, chars)
+		} else {
+			ok = darwin.TestKey(w.NativeHandle(), code, chars)
+		}
+	})
+	return ok
+}
+
+func glassTint(w *mygo.Window) (red, green, blue, alpha float64, ok bool) {
+	mygo.RunOnMain(func() { red, green, blue, alpha = darwin.TestGlassTint(w.NativeHandle()) })
+	return red, green, blue, alpha, true
+}
+
+func nativeGlassSupported() (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestNativeGlassSupported() })
+	return ok
+}
+
+func nativeGlass(w *mygo.Window) (class string, frame [4]float64, style int, ok bool) {
+	mygo.RunOnMain(func() { class, frame, style, ok = darwin.TestNativeGlass(w.NativeHandle()) })
+	return class, frame, style, ok
+}
+
+func nativeGlassTint(w *mygo.Window) (red, green, blue, alpha float64) {
+	mygo.RunOnMain(func() { red, green, blue, alpha = darwin.TestNativeGlassTint(w.NativeHandle()) })
+	return red, green, blue, alpha
+}
+
+func activateApp() { mygo.RunOnMain(darwin.TestActivate) }
+
+// Only X servers keep a keyboard's state for the tests after a test: see
+// left_behind_linux_test.go.
+func keyboardState() (state string, restore func()) { return "", func() {} }

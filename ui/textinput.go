@@ -62,10 +62,38 @@ func textInputBase(c *context, value *string, multiline bool) *node {
 	return e
 }
 
-// Placeholder shows s in an empty text input.
+// Placeholder shows s in an empty text input. On a field around an input,
+// as SearchField, TokenField and Combobox, it shows in the field's input,
+// in place of the field's own: SearchField shows Search without one.
 func (e *node) Placeholder(s string) *node {
-	if e.st.editor != nil {
-		e.st.editor.placeholder = s
+	in := e
+	if in.st.editor == nil && in.focusTo != nil {
+		in = in.focusTo
+	}
+	if in.st.editor != nil {
+		in.st.editor.placeholder = s
+	}
+	return e
+}
+
+// PlaceholderColor sets the color of this input's placeholder for this build.
+// When unset it uses the theme's TextMuted. It does not change entered text,
+// other inputs or the theme. A transparent color hides the placeholder.
+func (e *node) PlaceholderColor(color Color) *node {
+	if ed := e.st.editor; ed != nil && e.flags&flagEditable != 0 {
+		ed.placeholderColor, ed.placeholderColorSet = color, true
+	}
+	return e
+}
+
+// CaretWidth sets this input's painted caret width in DIPs for this build.
+// It defaults to one DIP. Positive widths are rounded to device pixels,
+// at least one pixel wide; zero and negative widths hide the caret. It does
+// not change text layout, input-method candidate bounds or caret blinking.
+// Other elements are unaffected.
+func (e *node) CaretWidth(width float32) *node {
+	if ed := e.st.editor; ed != nil && e.flags&flagEditable != 0 {
+		ed.caretWidth = max(width, 0)
 	}
 	return e
 }
@@ -74,12 +102,49 @@ func (e *node) Placeholder(s string) *node {
 // change it: the text can still be selected and copied, from the keyboard
 // too, as it takes the focus, without a caret; assistive technology reads
 // it as read-only.
+//
+// On an element of your own that MyGo does not edit or operate, a widget
+// that draws its value and handles its keys itself, it only tells
+// assistive technology that the element is read-only, as ARIA's
+// aria-readonly, and takes set-value, increment and decrement from it:
+// for a text box
+// (RoleTextField), combo box, check box, switch, slider, stepper, radio
+// group, list box, grid or tree grid, and for the cells and headers
+// (RoleCell, RoleColumnHeader, RoleRowHeader) of a grid or a tree grid,
+// not of a table. Other roles, and MyGo's own controls but for the text
+// inputs and text areas it is meant for, ignore it.
 func (e *node) ReadOnly(on bool) *node {
 	if ed := e.st.editor; ed != nil && e.flags&flagEditable != 0 {
 		ed.readOnly = on
 		if on {
 			ed.compose = ""
 		}
+	} else {
+		e.readOnly = on
+	}
+	return e
+}
+
+// Multiline tells assistive technology that an element of the text box
+// role (Role(RoleTextField)) that MyGo does not edit takes several lines,
+// as ARIA's aria-multiline. Text inputs and text areas know it
+// themselves, from the control they are, and other roles ignore it.
+func (e *node) Multiline(on bool) *node {
+	if ed := e.st.editor; ed == nil || e.flags&flagEditable == 0 {
+		e.multiline = on
+	}
+	return e
+}
+
+// MaxLength keeps the user from making a text input's value longer than n,
+// counted as HTML's maxlength counts it, in UTF-16 code units, a newline
+// as one: text typed, pasted or committed by an input method is cut to
+// what fits at the caret, and replacing a selection takes what fits in its
+// place. A value the app sets is not cut. n <= 0 means no limit.
+// Like ReadOnly, it holds for the input that comes until the next frame.
+func (e *node) MaxLength(n int) *node {
+	if ed := e.st.editor; ed != nil && e.flags&flagEditable != 0 {
+		ed.maxLength = n
 	}
 	return e
 }
@@ -253,6 +318,24 @@ func (e *node) Composing() bool {
 func (e *node) Password() *node {
 	if ed := e.st.editor; ed != nil && !ed.multiline {
 		ed.password = true
+	}
+	return e
+}
+
+// Search makes a text input one for searching, in the frames that call
+// it, as ARIA's searchbox and HTML's <input type=search>: assistive
+// technology reads it as a search field, as it reads a SearchField's
+// input, while the view draws it as it likes, with an icon and a clear
+// button of its own, and handles its keys. Name it with Label.
+//
+//	ui.TextInput(c, &app.query).Placeholder("Search").Label("Search mail").Search()
+func (e *node) Search() *node {
+	in := e
+	if in.flags&flagEditable == 0 && in.focusTo != nil {
+		in = in.focusTo // the input of the field around it
+	}
+	if in.flags&flagEditable != 0 {
+		in.search = true
 	}
 	return e
 }

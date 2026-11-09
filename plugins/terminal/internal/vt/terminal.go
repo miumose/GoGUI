@@ -3,7 +3,9 @@ package vt
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -149,6 +151,8 @@ const (
 	dataMouseTracking  = 11
 	dataTitle          = 12
 	dataPwd            = 13
+	dataColorFg        = 18 // then the background, the cursor and the palette
+	dataColorFgDefault = 22 // the same, defaults alone
 	dataViewportActive = 32
 	dataMode           = 37
 	dataMouseShape     = 41
@@ -184,10 +188,9 @@ func NewTerminal(cols, rows int, effects Effects) (*Terminal, error) {
 	t.setValue(optDeviceAttributes, cbDeviceAttributes)
 	t.setValue(optDesktopNotification, cbDesktopNotification)
 	t.setValue(optProgressReport, cbProgressReport)
-	// Images of the Kitty graphics protocol are not drawn: refuse them,
-	// so that programs fall back to something else.
-	var limit uint64
-	t.set(optKittyImageLimit, unsafe.Pointer(&limit))
+	// Images of the Kitty graphics protocol are refused until SetImageLimit
+	// takes them, so that programs fall back to something else.
+	t.SetImageLimit(0)
 	return t, nil
 }
 
@@ -336,6 +339,9 @@ const (
 	ModePasteEvents Mode = 5522
 	ModeSyncOutput  Mode = 2026
 	ModeGraphemes   Mode = 2027
+	// ModeColorScheme has the terminal tell the program when its colors
+	// go from light to dark or back (CSI ? 997 ; 1 n for dark, 2 light).
+	ModeColorScheme Mode = 2031
 )
 
 // Mode reports whether a mode is set.
@@ -368,6 +374,29 @@ func (t *Terminal) MouseShape() int {
 	var v int32
 	t.get(dataMouseShape, unsafe.Pointer(&v))
 	return int(v)
+}
+
+// TermColors are a terminal's colors; a color neither a program set nor a
+// default gave is not Has.
+type TermColors struct {
+	Foreground, Background, Cursor          RGB
+	HasForeground, HasBackground, HasCursor bool
+	Palette                                 [256]RGB
+}
+
+// Colors returns the colors programs see: those they set (OSC 4, 10, 11,
+// 12) over the defaults, or with defaults the defaults alone.
+func (t *Terminal) Colors(defaults bool) TermColors {
+	base := dataColorFg
+	if defaults {
+		base = dataColorFgDefault
+	}
+	var c TermColors
+	c.HasForeground = t.get(base, unsafe.Pointer(&c.Foreground)) == nil
+	c.HasBackground = t.get(base+1, unsafe.Pointer(&c.Background)) == nil
+	c.HasCursor = t.get(base+2, unsafe.Pointer(&c.Cursor)) == nil
+	t.get(base+3, unsafe.Pointer(&c.Palette))
+	return c
 }
 
 // AltScreen reports whether the alternate screen shows, as in full-screen
@@ -445,6 +474,36 @@ func (t *Terminal) RowText(y int) (text []rune, cols []int) {
 	return text, cols
 }
 
+// RowPrompt is how a row belongs to a shell's prompt, which the shell
+// marks with OSC 133 (shell integration).
+type RowPrompt int32
+
+const (
+	NoPrompt RowPrompt = iota
+	// PromptStart is the row a prompt starts on (OSC 133;A).
+	PromptStart
+	// PromptContinuation is a row the prompt or its input goes on over:
+	// one a long command wraps onto, or a prompt's next line.
+	PromptContinuation
+)
+
+// Row returns how row y of the viewport belongs to a shell's prompt, and
+// whether it soft-wraps into the next.
+func (t *Terminal) Row(y int) (prompt RowPrompt, wrap bool) {
+	ref, found := t.CellAt(0, y)
+	if !found {
+		return NoPrompt, false
+	}
+	var row uint64
+	if !ok(call(fnGridRefRow, uintptr(unsafe.Pointer(&ref)), uintptr(unsafe.Pointer(&row)))) {
+		return NoPrompt, false
+	}
+	if !ok(call(fnRowData, uintptr(row), rowDataSemanticPrompt, uintptr(unsafe.Pointer(&prompt)))) {
+		prompt = NoPrompt
+	}
+	return prompt, ok(call(fnRowData, uintptr(row), rowDataWrap, uintptr(unsafe.Pointer(&wrap)))) && wrap
+}
+
 // Hyperlink returns the URI of the hyperlink (OSC 8) of a cell, or "".
 func (t *Terminal) Hyperlink(ref GridRef) string {
 	var buf [512]byte
@@ -467,6 +526,18 @@ func (t *Terminal) Hyperlink(ref GridRef) string {
 // SetSelection selects s, or nothing when s is nil.
 func (t *Terminal) SetSelection(s *Selection) {
 	t.set(21, unsafe.Pointer(s))
+}
+
+// ExtendSelection moves the selection's logical end to ref, keeping its
+// original anchor even for a reversed selection. Read a fresh snapshot:
+// grid references cannot be kept across output, scrolling or resizing.
+func (t *Terminal) ExtendSelection(ref GridRef) bool {
+	s := Selection{size: unsafe.Sizeof(Selection{})}
+	if t.get(31, unsafe.Pointer(&s)) != nil {
+		return false
+	}
+	s.end, s.rectangle = ref, false
+	return t.set(21, unsafe.Pointer(&s)) == nil
 }
 
 // SelectAll returns a selection of everything, scrollback included.
@@ -541,7 +612,34 @@ func (t *Terminal) VT() []byte {
 	if p != 0 {
 		call(fnFree, 0, p, n)
 	}
-	return b
+	return t.padRows(b)
+}
+
+// padRows adds the blank rows at the end of the screen, which the
+// formatter leaves out, to the rows of a VT snapshot. Without them, the
+// rows written scroll fewer into the scrollback of the terminal they are
+// replayed in: what was scrollback shows on the screen, as after clear,
+// and the cursor, on a blank row under the last one written, lands on
+// that row, whose text what is written next overwrites. The rows end
+// where the snapshot places the cursor, one "\r\n" after the other.
+func (t *Terminal) padRows(b []byte) []byte {
+	_, rows := t.Size()
+	total := int(t.Scrollbar().Total)
+	if total <= rows || t.AltScreen() {
+		// No scrollback, or a full-screen program's screen, which has
+		// none: the cursor's position alone places it.
+		return b
+	}
+	x, y := t.Cursor()
+	end := bytes.LastIndex(b, fmt.Appendf(nil, "\x1b[%d;%dH", y+1, x+1))
+	if end < 0 {
+		return b
+	}
+	pad := total - (bytes.Count(b[:end], []byte("\r\n")) + 1)
+	if pad <= 0 {
+		return b
+	}
+	return slices.Concat(b[:end], bytes.Repeat([]byte("\r\n"), pad), b[end:])
 }
 
 // Compress compresses some of the scrollback, as when the terminal is

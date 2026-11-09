@@ -66,6 +66,77 @@ func TestDragSelectRows(t *testing.T) {
 	}
 }
 
+// A drag whose moves and release all come between two frames, as when
+// frames are slow, chooses the rows up to where the pointer let go, though
+// it moved on since, before the keys that came after it and unless a press
+// came after it; so does a drag over a table's cells.
+func TestDragSelectBetweenFrames(t *testing.T) {
+	tt, _, sel := dragSelectList(t, 20)
+	x, y := rowCenter(t, tt, "Row 1")
+	_, y7 := rowCenter(t, tt, "Row 7")
+	_, y9 := rowCenter(t, tt, "Row 9")
+	event := func(kind platform.SurfaceEventKind, y float32) {
+		tt.rt.event(platform.SurfaceEvent{Kind: kind, X: float64(x), Y: float64(y)})
+	}
+	drag := func() {
+		event(platform.PointerDown, y)
+		event(platform.PointerMove, y7)
+		event(platform.PointerUp, y7)
+	}
+	drag()
+	event(platform.PointerMove, y9)
+	tt.Frame()
+	if got := chosenRows(sel); !slices.Equal(got, []int{1, 2, 3, 4, 5, 6, 7}) {
+		t.Fatalf("dragged Row 1 to Row 7 and released within a frame: chose %v", got)
+	}
+	drag()
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.KeyPressed, Key: platform.Key(KeyDown)})
+	tt.Frame()
+	if got := chosenRows(sel); !slices.Equal(got, []int{8}) {
+		t.Fatalf("then dragged Row 1 to Row 7 and pressed Down within a frame: chose %v", got)
+	}
+	drag()
+	event(platform.PointerDown, y9)
+	event(platform.PointerUp, y9)
+	tt.Frame()
+	if got := chosenRows(sel); !slices.Equal(got, []int{9}) {
+		t.Fatalf("then dragged Row 1 to Row 7 and clicked Row 9 within a frame: chose %v", got)
+	}
+
+	tt2, s, sel2 := cellTable(t, 8, 3, 0)
+	cx, cy := rowCenter(t, tt2, "r1c1")
+	cx2, cy2 := rowCenter(t, tt2, "r4c2")
+	cx3, _ := rowCenter(t, tt2, "r4c3")
+	tt2.rt.event(platform.SurfaceEvent{Kind: platform.PointerDown, X: float64(cx), Y: float64(cy)})
+	tt2.rt.event(platform.SurfaceEvent{Kind: platform.PointerMove, X: float64(cx2), Y: float64(cy2)})
+	tt2.rt.event(platform.SurfaceEvent{Kind: platform.PointerUp, X: float64(cx2), Y: float64(cy2)})
+	tt2.rt.event(platform.SurfaceEvent{Kind: platform.PointerMove, X: float64(cx3), Y: float64(cy2)})
+	tt2.Frame()
+	wantBlock(t, s, sel2, "dragged r1c1 to r4c2 and released within a frame", []int{1, 2, 3, 4}, ColumnRange{Cursor: "B", Anchor: "A"}, []string{"A", "B"})
+}
+
+// A drag adding to the choice (Cmd) chooses the rows from the one pressed
+// to the one under the pointer besides those chosen before, on every
+// platform: going back takes out the rows it leaves.
+func TestDragSelectAddingShrinksBack(t *testing.T) {
+	tt, _, sel := dragSelectList(t, 20)
+	tt.Click("Row 9")
+	x, y := rowCenter(t, tt, "Row 1")
+	_, y5 := rowCenter(t, tt, "Row 5")
+	_, y2 := rowCenter(t, tt, "Row 2")
+	tt.send(platform.SurfaceEvent{Kind: platform.PointerDown, X: float64(x), Y: float64(y), Mods: platform.Modifiers(Cmd)})
+	tt.Move(x, y+3)
+	tt.Move(x, y5)
+	if got := chosenRows(sel); !slices.Equal(got, []int{1, 2, 3, 4, 5, 9}) {
+		t.Fatalf("Cmd-drag Row 1 to Row 5 with Row 9 chosen: chose %v", got)
+	}
+	tt.Move(x, y2)
+	tt.Release(x, y2)
+	if got := chosenRows(sel); !slices.Equal(got, []int{1, 2, 9}) {
+		t.Fatalf("Cmd-drag to Row 5 and back to Row 2: chose %v, want [1 2 9]", got)
+	}
+}
+
 // Held below the list, the drag scrolls it and goes on choosing, to the
 // end, though the row pressed scrolls out of view.
 func TestDragSelectScrollsAtEdge(t *testing.T) {
@@ -82,6 +153,36 @@ func TestDragSelectScrollsAtEdge(t *testing.T) {
 		t.Fatalf("held at the bottom edge: drag on %v, chose %d rows (%v…%v)", s.dragSel.on, len(got), got[:min(2, len(got))], got[max(0, len(got)-2):])
 	}
 	tt.Release(x, 299)
+}
+
+// In a list shorter than its two edges, a drag held below its middle
+// scrolls it down and one held above scrolls it up.
+func TestDragSelectShortListScrollsTowardThePointer(t *testing.T) {
+	s := &ListState{DragSelect: true}
+	s.Selection = &Selection[int]{}
+	tt := NewTester(func(c *Context) {
+		Column(c).Children(func() {
+			List(c, s, 30, func(i int) { Textf(c, "Row %d", i) }).Height(50)
+		})
+	}, 300, 300)
+	tt.Frame()
+	st := s.frame.e.st
+	for _, held := range []struct {
+		y    float32
+		down bool
+	}{{30, true}, {20, false}} {
+		scrollBy(st, 0, 100-float32(st.scrollY))
+		tt.Frame()
+		x, from := st.x+20, st.scrollY
+		tt.Press(x, st.y+25)
+		tt.Move(x, st.y+25+4)
+		tt.Move(x, st.y+held.y)
+		tt.Frame()
+		if moved := st.scrollY - from; held.down && moved <= 0 || !held.down && moved >= 0 {
+			t.Errorf("held %v down a list 50 tall: scrolled by %v", held.y, moved)
+		}
+		tt.Release(x, st.y+held.y)
+	}
 }
 
 func TestDragSelectWithReorderPanics(t *testing.T) {

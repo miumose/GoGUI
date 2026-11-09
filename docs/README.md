@@ -87,7 +87,8 @@ What every app has, whether its windows show native UI or web pages.
   navigation, downloads, permissions, printing.
 - [The application](app.md): the lifecycle, quitting, a single instance,
   deep links, file associations, recent documents, starting at login,
-  well-known directories, the jump list, browsing data and cookies.
+  well-known directories, the jump list, drawing web pages on Linux,
+  browsing data, cookies and sessions.
 - [Menus and the tray](menus.md): application, context and Dock menus,
   keyboard shortcuts and tray icons.
 - [Documents](documents.md): document-based apps, a window per file, with
@@ -99,6 +100,10 @@ What every app has, whether its windows show native UI or web pages.
 - [Desktop APIs](native.md): dialogs, notifications, the clipboard, the
   shell, displays, dark mode, power, the network status, secrets, watching
   files and global shortcuts.
+- [Native modules](native-modules.md) (experimental): Go interfaces implemented in
+  Swift, Rust or Zig, without cgo, for macOS's frameworks and views, Rust
+  crates and Zig and C libraries, which the CLI builds, puts into apps and
+  publishes for the users of your Go packages.
 - [Clipboard and drag data](data-transfer.md): multiple representations,
   file lists, custom formats, lazy providers, and clipboard persistence.
 - [Audio](audio.md): sound effects, streamed music and sound an app makes
@@ -128,8 +133,8 @@ components, from buttons to tables.
 - [Building and distributing](distribution.md): packaged apps for macOS,
   Windows and Linux, signing, installers and disk images.
 - [Auto-updates](updates.md): signed updates from GitHub releases, an S3
-  bucket or your own server, delta updates, and an update window in the
-  manner of Sparkle.
+  bucket, your own server or the app's own update service, delta updates,
+  and an update window in the manner of Sparkle.
 - [GitHub Actions](github-actions.md): a workflow that builds, signs and
   notarizes the apps of every platform, and publishes them with their
   updates, when you push a tag.
@@ -153,6 +158,17 @@ components, from buttons to tables.
 - [Game](plugins/game.md): what games need beyond what apps do, opt-in:
   a game loop in fixed steps with its input, a camera, and gamepads in
   one standard layout.
+- [Loading](plugins/loading.md): loading.dev's 29 loading indicators for
+  native UI.
+- [SF Symbols](plugins/sfsymbols.md): Apple's SF Symbols for native UI on
+  macOS, drawn by the system.
+- [Automation](plugins/automation.md): drive a running app from another
+  process, as end-to-end test runners and agents do: its windows,
+  elements, input, menus and screenshots, and `mygo-automation`, its
+  command line client for agents.
+- [PermissionFlow](plugins/permissionflow.md): the system's permissions,
+  such as Accessibility and Screen Recording, checked and asked for, and a
+  guide to System Settings with the app to drag into its list.
 
 ## Reference
 
@@ -176,11 +192,13 @@ Apps run on:
 | Platform | Windows with web pages need | Windows of native UI need |
 |---|---|---|
 | macOS 12 or later | nothing: WKWebView is part of macOS | nothing: they draw with Metal |
-| Linux (x64, arm64) | GTK 3 and WebKitGTK 4.1 (or 4.0): `libwebkit2gtk-4.1-0` on Debian and Ubuntu, `webkit2gtk4.1` on Fedora | GTK 3 alone |
+| Linux (x64, arm64) | GTK 3 and WebKitGTK 4.1 (or 4.0): `libwebkit2gtk-4.1-0` on Debian and Ubuntu, `webkit2gtk4.1` on Fedora, `webkit2gtk-4.1` on Arch Linux | GTK 3 alone |
 | Windows 10 and 11 (x64, arm64) | the [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/), which Windows 11 includes | nothing: they draw with Direct3D 11 |
 
 An app whose windows all show native UI needs neither WebKitGTK nor the
 WebView2 Runtime. Tray icons on Linux also need `libayatana-appindicator3`.
+On Linux, MyGo turns WebKitGTK's DMA-BUF renderer off unless the app opts
+in, see [drawing web pages on Linux](app.md#drawing-web-pages-on-linux).
 
 An app that shows web pages can ask whether the machine has a webview with
 `mygo.WebViewAvailable()`, also before `App.Run`, and open a window of native UI where it has

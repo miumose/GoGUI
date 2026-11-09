@@ -25,6 +25,9 @@ type NSRect struct {
 	Size   NSSize
 }
 
+// caFrameRateRange mirrors Core Animation's CAFrameRateRange.
+type caFrameRateRange struct{ Minimum, Maximum, Preferred float32 }
+
 var (
 	msgSendAddr      uintptr
 	msgSendSuperAddr uintptr
@@ -36,6 +39,7 @@ var (
 	msgRectForRect   func(obj id, sel objc.SEL, r NSRect, style uint) NSRect
 	msgRectToRect    func(obj id, sel objc.SEL, r NSRect) NSRect
 	msgFloat         func(obj id, sel objc.SEL) float64
+	msgFloat32       func(obj id, sel objc.SEL) float32
 	msgSetFloat      func(obj id, sel objc.SEL, v float64)
 	msgSize          func(obj id, sel objc.SEL) NSSize
 	msgSetSize       func(obj id, sel objc.SEL, s NSSize)
@@ -58,9 +62,11 @@ var (
 	msgFloat2ID      func(obj id, sel objc.SEL, a, b float64) id
 	msgFontFamily    func(obj id, sel objc.SEL, family id, traits uint, weight int, size float64) id
 	msgMouseEvent    func(cls id, sel objc.SEL, typ uint, loc NSPoint, flags uint, ts float64, wn int, ctx id, eventNumber int, clickCount int, pressure float32) id
+	msgHitTest       func(obj id, sel objc.SEL, p NSPoint) id
 	msgKeyEvent      func(cls id, sel objc.SEL, typ uint, loc NSPoint, flags uint, ts float64, wn int, ctx id, chars, charsIgnoring id, repeat bool, keyCode uint16) id
 	msgDrawImage     func(obj id, sel objc.SEL, dst, src NSRect, op uint, fraction float64)
 	msgInitBitmap    func(obj id, sel objc.SEL, planes uintptr, width, height, bitsPerSample, samplesPerPixel int, alpha, planar bool, colorSpace id, bytesPerRow, bitsPerPixel int) id
+	msgSetRateRange  func(obj id, sel objc.SEL, r caFrameRateRange)
 
 	blockCopy    func(block uintptr) uintptr
 	blockRelease func(block uintptr)
@@ -132,8 +138,10 @@ func load() {
 		purego.RegisterFunc(&msgSetRect, msgSendAddr)
 		purego.RegisterFunc(&msgDrawImage, msgSendAddr)
 		purego.RegisterFunc(&msgInitBitmap, msgSendAddr)
+		purego.RegisterFunc(&msgSetRateRange, msgSendAddr)
 		purego.RegisterFunc(&msgSetRectBool, msgSendAddr)
 		purego.RegisterFunc(&msgFloat, msgSendAddr)
+		purego.RegisterFunc(&msgFloat32, msgSendAddr)
 		purego.RegisterFunc(&msgSetFloat, msgSendAddr)
 		purego.RegisterFunc(&msgSize, msgSendAddr)
 		purego.RegisterFunc(&msgSetSize, msgSendAddr)
@@ -157,6 +165,7 @@ func load() {
 		purego.RegisterFunc(&msgFontFamily, msgSendAddr)
 		purego.RegisterFunc(&msgKeyEvent, msgSendAddr)
 		purego.RegisterFunc(&msgMouseEvent, msgSendAddr)
+		purego.RegisterFunc(&msgHitTest, msgSendAddr)
 
 		poolPushFn = mustDlsym(libObjC, "objc_autoreleasePoolPush")
 		poolPopFn = mustDlsym(libObjC, "objc_autoreleasePoolPop")

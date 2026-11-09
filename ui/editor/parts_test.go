@@ -269,3 +269,237 @@ func TestCodeEditorHoverInteractive(t *testing.T) {
 		t.Fatalf("after Escape: hover shown %v, editor focused %v", ed.hover.shown, st.Focused())
 	}
 }
+
+// TestDiffSeparatorsKeepRoomOnlyForScrollbars: a diff that fits its
+// content shows no scroll bar, so its separators run to the viewer's right
+// edge; one that scrolls keeps the room of the scroll bar's track.
+func TestDiffSeparatorsKeepRoomOnlyForScrollbars(t *testing.T) {
+	lines := make([]string, 60)
+	for i := range lines {
+		lines[i] = "line " + strconv.Itoa(i)
+	}
+	old := strings.Join(lines, "\n")
+	lines[30] = "changed"
+	nw := strings.Join(lines, "\n")
+
+	for _, tc := range []struct {
+		name string
+		fit  bool
+		want float32 // where the separators end, from the viewer's left edge
+	}{
+		{"fit content", true, 800},
+		{"scrolling", false, 800 - scrollbarWidth},
+	} {
+		d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), FitContent: tc.fit}
+		var right float32
+		d.RenderSeparator = func(c *ui.Context, sep ui.Element, s *DiffSeparator) {
+			// A frame's bounds are the last frame's, which the second Frame reads.
+			b := sep.Bounds()
+			right = b.X + b.W
+			sep.Children(func() { ui.Text(c, "separator") })
+		}
+		tt := ui.NewTester(func(c *ui.Context) { DiffView(c, d).FillWidth() }, 800, 600)
+		tt.Frame()
+		tt.Frame()
+		if right != tc.want {
+			t.Errorf("%s: separators end at %v, want %v", tc.name, right, tc.want)
+		}
+	}
+}
+
+// The sides of a split diff wrap their lines at the same width, whether
+// or not it fits its content, though only the new side draws the scroll
+// bar of a viewer that scrolls.
+func TestDiffSplitSidesWrapAlike(t *testing.T) {
+	long := strings.Repeat("word ", 80)
+	old := "a\n" + long + "\nb\nc"
+	nw := "a\n" + long + "\nB\nc"
+	for _, fit := range []bool{false, true} {
+		d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), Layout: DiffSplit, Wrap: true, FitContent: fit}
+		tt := ui.NewTester(func(c *ui.Context) { DiffView(c, d).FillWidth() }, 800, 600)
+		tt.Frame()
+		tt.Frame()
+		if o, n := d.eds[0].view.wrapWidth, d.eds[1].view.wrapWidth; o != n || o <= 0 {
+			t.Errorf("FitContent %v: the old side wraps at %v, the new one at %v", fit, o, n)
+		}
+	}
+}
+
+// A diff that fits its content is as high as its lines with the unchanged
+// ones folded before it is first drawn: below the view of a scroll
+// container, it would else stand as high as all its lines until scrolled
+// to, then shrink, and the container's end with it, under the user.
+func TestDiffFitContentFoldsBeforeDrawn(t *testing.T) {
+	var lines []string
+	for i := range 400 {
+		lines = append(lines, "line "+strconv.Itoa(i))
+	}
+	old := strings.Join(lines, "\n")
+	lines[200] = "changed"
+	nw := strings.Join(lines, "\n")
+	for _, layout := range []DiffLayout{DiffUnified, DiffSplit} {
+		d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), Layout: layout, FitContent: true}
+		var h float32
+		tt := ui.NewTester(func(c *ui.Context) {
+			ui.Scroll(c).Fill().Children(func() {
+				ui.Box(c).Height(5000)
+				// A frame's bounds are the last frame's.
+				h = DiffView(c, d).FillWidth().Bounds().H
+			})
+		}, 800, 600)
+		tt.Frame()
+		tt.Frame()
+		tt.Frame()
+		if max := float32(40 * d.eds[1].view.lineHeight); h <= 0 || h > max {
+			t.Errorf("layout %v: the diff not yet drawn is %v high, want at most %v", layout, h, max)
+		}
+	}
+}
+
+// A long diff that fits its content builds the separators of the folded
+// lines in view of the scroll container it is in, not all of its own.
+func TestDiffFitContentBuildsSeparatorsInView(t *testing.T) {
+	var lines []string
+	for i := range 20000 {
+		lines = append(lines, "line "+strconv.Itoa(i))
+	}
+	old := strings.Join(lines, "\n")
+	for i := 0; i < len(lines); i += 50 {
+		lines[i] = "changed " + strconv.Itoa(i)
+	}
+	nw := strings.Join(lines, "\n")
+	for _, layout := range []DiffLayout{DiffUnified, DiffSplit} {
+		built := 0
+		d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), Layout: layout, FitContent: true}
+		d.RenderSeparator = func(c *ui.Context, sep ui.Element, s *DiffSeparator) {
+			built++
+			DefaultSeparator(c, sep, s)
+		}
+		tt := ui.NewTester(func(c *ui.Context) {
+			ui.Scroll(c).Fill().Children(func() { DiffView(c, d).FillWidth() })
+		}, 800, 600)
+		tt.Frame()
+		tt.Frame()
+		built = 0
+		// After a pause, as the first frame of a scroll.
+		tt.Advance(time.Second)
+		tt.Scroll(400, 300, 0, 200)
+		tt.Frame()
+		if built == 0 || built > 100 {
+			t.Errorf("layout %v: a frame built %d of the diff's 400 separators", layout, built)
+		}
+	}
+}
+
+// A long diff that fits its content builds the separators that come into
+// view as its scroll container jumps further than it built around what it
+// showed last, in one wheel's turn or a scroll bar's drag.
+func TestDiffFitContentBuildsSeparatorsScrolledTo(t *testing.T) {
+	var lines []string
+	for i := range 20000 {
+		lines = append(lines, "line "+strconv.Itoa(i))
+	}
+	old := strings.Join(lines, "\n")
+	for i := 0; i < len(lines); i += 50 {
+		lines[i] = "changed " + strconv.Itoa(i)
+	}
+	nw := strings.Join(lines, "\n")
+	for _, layout := range []DiffLayout{DiffUnified, DiffSplit} {
+		d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), Layout: layout, FitContent: true}
+		var labels []string
+		d.RenderSeparator = func(c *ui.Context, sep ui.Element, s *DiffSeparator) {
+			l := "separator " + strconv.Itoa(s.a)
+			labels = append(labels, l)
+			sep.Children(func() { ui.Text(c, l) })
+		}
+		tt := ui.NewTester(func(c *ui.Context) {
+			ui.Scroll(c).Fill().Children(func() { DiffView(c, d).FillWidth() })
+		}, 800, 600)
+		tt.Frame()
+		tt.Frame()
+		// No frame but those the scroll asks for, as in a window.
+		tt.Scroll(400, 300, 0, 3000)
+		shown := 0
+		for _, l := range labels {
+			if r, ok := tt.Find(l); ok && r.Y+r.H > 0 && r.Y < 600 {
+				shown++
+			}
+		}
+		if shown == 0 {
+			t.Errorf("layout %v: no separator shown in view after scrolling 3000", layout)
+		}
+	}
+}
+
+// A long diff that fits its content measures the wraps of the lines it
+// shows, not of those it folds away, which it measures once they show:
+// a window resized through widths would else measure every line at each.
+func TestDiffFitContentMeasuresLinesShown(t *testing.T) {
+	var lines []string
+	for i := range 20000 {
+		lines = append(lines, "line "+strconv.Itoa(i)+" "+strings.Repeat("word ", i%40))
+	}
+	old := strings.Join(lines, "\n")
+	lines[10000] = "changed"
+	nw := strings.Join(lines, "\n")
+	d := &DiffState{Old: NewBuffer(old), New: NewBuffer(nw), Wrap: true, FitContent: true}
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Scroll(c).Fill().Children(func() { DiffView(c, d).FillWidth() })
+	}, 800, 600)
+	tt.Frame()
+	tt.Frame()
+	v := &d.eds[1].view
+	if known := v.heights.wraps.known; known == 0 || known > 1000 {
+		t.Errorf("%d of the %d lines' wraps measured, those shown being a few", known, v.text.LineCount())
+	}
+	d.ExpandUnchanged = true
+	tt.Frame()
+	tt.Frame()
+	if known := v.heights.wraps.known; known < v.text.LineCount() {
+		t.Errorf("all lines shown, %d of their %d wraps measured", known, v.text.LineCount())
+	}
+}
+
+// HoverDelay sets how long the pointer rests before the hover is asked.
+func TestCodeEditorHoverDelay(t *testing.T) {
+	st := &State{Buffer: NewBuffer("SELECT 1\n"), HoverDelay: 2 * time.Second}
+	asked := 0
+	st.OnHover = func(r HoverRequest) { asked++ }
+	tt := ui.NewTester(func(c *ui.Context) { View(c, st).Fill() }, 600, 300)
+	tt.Frame()
+	ed := &st.ed
+	tt.Move(ed.textX+ed.view.charWidth*2, float32(-ed.scrollY)+ed.view.lineHeight/2)
+	tt.Advance(time.Second)
+	tt.Frame()
+	if asked != 0 {
+		t.Fatal("asked before the delay")
+	}
+	tt.Advance(1500 * time.Millisecond)
+	tt.Frame()
+	if asked != 1 {
+		t.Fatalf("asked %d times after the delay", asked)
+	}
+}
+
+// With NoPointerHover the resting pointer asks for no hover, nor shows a
+// diagnostic's; ShowHover, from the keys, still asks.
+func TestCodeEditorNoPointerHover(t *testing.T) {
+	st := &State{Buffer: NewBuffer("SELECT 1\n"), NoPointerHover: true}
+	asked := 0
+	st.OnHover = func(r HoverRequest) { asked++ }
+	tt := ui.NewTester(func(c *ui.Context) { View(c, st).Fill().AutoFocus() }, 600, 300)
+	tt.Frame()
+	st.SetDiagnostics(st.Buffer.Version(), []Diagnostic{{Start: 0, End: 6, Message: "a problem"}})
+	ed := &st.ed
+	tt.Move(ed.textX+ed.view.charWidth*2, float32(-ed.scrollY)+ed.view.lineHeight/2)
+	tt.Advance(time.Hour)
+	tt.Frame()
+	if asked != 0 || tt.HasText("a problem") {
+		t.Fatalf("the resting pointer asked %d times, problem shown %v", asked, tt.HasText("a problem"))
+	}
+	st.Run(ShowHover)
+	tt.Frame()
+	if asked != 1 {
+		t.Fatalf("ShowHover asked %d times", asked)
+	}
+}

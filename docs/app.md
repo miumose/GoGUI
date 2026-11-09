@@ -25,8 +25,8 @@ in `WhenReady`, or from any goroutine after that.
 
 Before `Run`, `main` sets the app up: it binds services, handles protocols,
 adds listeners, and makes settings such as `App.SetName`, `App.SetMenu`,
-`App.Dock.SetMenu` and `Theme.SetSource`, which take effect when the app
-starts. It may also read what needs no running app, such as `App.Path`,
+`App.Dock.SetMenu`, `Theme.SetSource` and `Theme.SetGTKCSS`, which take
+effect when the app starts. It may also read what needs no running app, such as `App.Path`,
 `App.Locale` or `Power.IsOnBattery`, and register the app with the system
 (`App.SetOpenAtLogin`, `App.RegisterURLScheme`). Everything else needs the
 running app: when `main` calls the clipboard, displays, dialogs,
@@ -58,8 +58,8 @@ where:
 | `OnDidBecomeActive`, `OnDidResignActive` | the app became, or stopped being, the active app |
 | `OnWindowCreated(func(w *mygo.Window))` | a window was created |
 | `OnWindowAllClosed` | the last window closed, unless the app is quitting |
-| `OnBeforeQuit(func(e *mygo.QuitEvent))` | a quit started, before the windows close; `e.PreventDefault()` cancels it |
-| `OnWillQuit(func(e *mygo.QuitEvent))` | every window has closed and the app is about to quit; it can still be canceled |
+| `OnBeforeQuit(func(e *mygo.QuitEvent))` | a quit started, before the windows close; `e.PreventDefault()` cancels it, unless the OS ends the session (`e.SessionEnding`) |
+| `OnWillQuit(func(e *mygo.QuitEvent))` | every window has closed and the app is about to quit; it can still be canceled, unless the OS ends the session |
 | `OnQuit` | the event loop stopped, right before `Run` returns |
 
 Each returns a function that removes the listener.
@@ -87,9 +87,29 @@ mygo.App.OnActivate(func(hasVisibleWindows bool) {
   then quits; `OnBeforeQuit` and `OnWillQuit` listeners can cancel it too.
   Cmd+Q, the Quit menu item and Ctrl+C in the terminal (SIGINT and SIGTERM)
   quit the same way; a second signal exits at once.
+- When the OS ends the session (logout, restart, shutdown) on Windows and
+  macOS, the quit listeners and the windows' `OnClose` run all the same,
+  in that order and before `OnQuit`, but can't cancel it: the
+  `QuitEvent`'s `SessionEnding` is set, and the process may end as soon as
+  they and `OnQuit` return. Save what must survive synchronously there,
+  without dialogs or goroutines to wait for. A quit that already ran them
+  only finishes. Linux tells MyGo of no session end: shutdown, and a
+  logout that stops the user's processes, send SIGTERM, which quits like
+  `App.Quit()`.
 - `App.Exit(code)` exits right away, without events.
 - `App.Relaunch()` quits, then starts the app again with the same
   arguments, for example after a setting that needs a restart.
+  `App.Relaunch(args...)` passes other arguments instead, which replace
+  those the app started with, so that the new instance knows why it
+  starts, without a file the two would share:
+
+  ```go
+  mygo.App.Relaunch("--safe-mode")
+  ```
+
+  They reach the new instance on macOS (through Launch Services, also after
+  an update), Linux and Windows, and under `mygo dev`. In browsers
+  `Relaunch` only quits.
 
 ## A single instance
 
@@ -226,6 +246,18 @@ launch at login apart, to start in the background:
 mygo.NewWindow(mygo.WindowOptions{URL: "/", Hidden: mygo.App.WasOpenedAtLogin()})
 ```
 
+On Windows the Run entry starts the app with the user's normal
+(unelevated) token, even when the user is an administrator: the app
+cannot create network adapters, change the system's proxy or write to
+protected folders. An app that needs administrator rights registers a
+logon task in Task Scheduler with the run level `HighestAvailable`
+instead (`schtasks /Create /SC ONLOGON /RL HIGHEST`, or the Task
+Scheduler API), which starts it elevated without asking, and does not
+call `SetOpenAtLogin`. Creating the task needs administrator rights
+itself, so the app asks for them once, as the user turns the setting on.
+`WasOpenedAtLogin` does not tell such a launch apart: give the task's
+command an argument of the app's own for that.
+
 ## Directories
 
 `App.Path` returns well-known directories:
@@ -263,8 +295,9 @@ again.
 `MYGO_ENV=production` makes any build behave like one. `App.IsPackaged()`
 reports whether it runs from an app bundle. `App.Locale()` returns the
 language the app shows, such as `"zh-Hans"`, of those it is written in,
-and `App.PreferredLanguages()` the languages the user reads, as the system
-lists them; see [the language the app shows](i18n.md#the-language-the-app-shows).
+`App.PreferredLanguages()` the languages the user reads, as the system
+lists them, and `App.ChosenLocale()` the language `App.SetLocale` chose,
+`""` while the app follows the user's; see [the language the app shows](i18n.md#the-language-the-app-shows).
 Before 0.5, `App.Locale()` returned the user's first preferred language
 whatever the app is written in.
 
@@ -279,7 +312,10 @@ whatever the app is written in.
 - `App.SetActivationPolicy(mygo.ActivationPolicyAccessory)` removes the
   Dock icon of an app that lives in the menu bar, see
   [tray icons](menus.md#tray-icons); its windows can still show.
-- `App.Focus` brings the app to the front. On macOS, `App.Hide` and
+  `App.ActivationPolicy` returns the policy.
+- `App.Focus` brings the app to the front, and `App.IsActive` reports
+  whether it is there: the active app, or the one with the focused window
+  on Windows and Linux. On macOS, `App.Hide` and
   `App.Show` hide and show all its windows, and `App.ShowAboutPanel` shows
   the standard about panel.
 
@@ -323,12 +359,53 @@ tasks removes them. Windows replaces the whole jump list whenever the app
 changes a part of it, so `App.JumpList` keeps the parts and commits them
 together. Its methods do nothing on macOS and Linux.
 
+## Drawing web pages on Linux
+
+WebKitGTK draws pages on the GPU with its DMA-BUF renderer where it can,
+and that renderer shows blank windows with NVIDIA's driver, in virtual
+machines and in containers. So MyGo turns it off by default: before GTK
+starts, `App.Run` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` unless the
+environment already has the variable. Pages then draw on the CPU, which
+costs frame rate where the renderer would have worked: on a Wayland desktop
+with Intel's GPU, a long page (a chat transcript of 4,600 elements)
+scrolls at 11–19 frames per second with a core busy, against 56 with the
+renderer and half the CPU.
+
+An app that knows where it runs can leave the renderer on, before
+`App.Run`:
+
+```go
+mygo.App.SetDMABUFRenderer(mygo.DMABUFRendererAuto)
+```
+
+| Setting | The renderer |
+|---|---|
+| `DMABUFRendererOff` (the default) | off |
+| `DMABUFRendererAuto` | on where the host is known to draw with it, off elsewhere |
+| `DMABUFRendererOn` | left to WebKitGTK, which uses it wherever it can |
+
+`DMABUFRendererAuto` leaves it on when GTK will open a Wayland display
+(`WAYLAND_DISPLAY` names a socket that exists, and `GDK_BACKEND` does not
+put another backend first) and the system has a GPU with a Mesa driver
+(a render node of a driver with 3D): not NVIDIA's driver
+(`/sys/module/nvidia`, `/proc/driver/nvidia/version`), not software OpenGL
+(`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER=llvmpipe`), not in a container
+(`/.dockerenv`, `/run/.containerenv`), WSL or a virtual machine (the
+firmware's `product_name` or `sys_vendor` names VirtualBox, VMware, QEMU,
+KVM, Hyper-V and others). Use `DMABUFRendererOn` only where you know the
+machines, as in a kiosk.
+
+`WEBKIT_DISABLE_DMABUF_RENDERER`, set by the user, always wins, whatever
+the app chose: `0` turns the renderer on, `1` off. Other systems ignore the
+setting.
+
 ## Browsing data
 
 `App.ClearBrowsingData()` deletes what the app's pages stored: cookies,
 local and session storage, IndexedDB, service workers and caches, for
 example when the user signs out. Open pages keep what they hold in memory
-until they reload.
+until they reload. It clears the default session; `Session.ClearData`
+clears another, or some kinds of data only.
 
 ### Cookies
 
@@ -381,13 +458,69 @@ the main thread the app keeps handling events while they wait. Cookies
 may carry the user's credentials: rather than binding the module to the
 pages, bind a backend method that does what the page needs.
 
-On Windows, WebView2 gives cookies only through a web view: before a
-window shows a page, the methods, and `App.ClearBrowsingData`, make a
-hidden one, which also makes the WebView2 browser process start, and a
-window's first page waits for the calls under way when its web view is
-made. WebView2 applies changes after its calls return, so the methods
+On Windows, WebView2 gives cookies only through a web view: while no
+window or web view in native UI shows a page, the methods, and
+`App.ClearBrowsingData`, make a hidden one, which also makes the WebView2
+browser process start, and a window's first page waits for the calls
+under way when its web view is made. The hidden web view closes once a
+page shows, or, in an app showing none, a few seconds after the last
+call, and WebView2's processes exit with it; it stays while the
+session has cookies that WebView2 keeps only while they run: those with
+a zero `Expires`, and any of an ephemeral session. WebView2 applies changes after its calls return, so the methods
 wait until the change shows, and fail when it does not within two
 seconds, as when the engine refuses a cookie. On Linux they need
 WebKitGTK 2.42 or newer, and `Set` libsoup 2.70 or newer; WebKitGTK keeps
 the cookies in `cookies.sqlite` of the app's user data directory
 (`~/.config/<Name>`).
+
+### Sessions
+
+Every page shows in the default session unless `PageOptions.Session` names
+another: a store of cookies, local and session storage, IndexedDB, caches
+and service workers of its own, which the pages of other sessions don't
+see, as Electron's partitions. Two accounts of a service side by side, a
+private window, a preview that must not see the user's sign-ins, or a
+third-party page kept away from the app's own storage each take one:
+
+```go
+work := mygo.NewSession("work")        // kept on disk from one run to the next
+private := mygo.NewEphemeralSession()  // in memory only
+
+win := mygo.NewWindow(mygo.WindowOptions{
+	URL:  "https://mail.example.com",
+	Page: mygo.PageOptions{Session: work},
+})
+
+list, err := work.Cookies.List(mygo.CookieFilter{})
+err = work.Cookies.Set(mygo.Cookie{Name: "session", Value: token, Domain: "example.com"})
+err = work.ClearData(mygo.SiteDataAll)                             // signing out
+err = work.ClearData(mygo.SiteDataCookies | mygo.SiteDataCaches)  // some kinds
+```
+
+`NewSession` returns the same session for the same name, whose data stays
+on disk as the default session's does. `NewEphemeralSession` returns a new
+session every time, which writes nothing to disk: its data goes when the
+last page using it closes, and its next page starts with none. A cookie set
+before its first page opens goes to that page. `mygo.Cookies` and
+`App.ClearBrowsingData` are the default session's, which
+`mygo.DefaultSession()` returns too. A window a page opens with
+`window.open` or a `target="_blank"` link is in its opener's session,
+whatever the `Session` of the options the open handler returns. Custom
+protocols (`mygo.Protocol`) serve the pages of every session, and a web
+view in [native UI](ui/web-view.md) takes a session in its `PageOptions`
+too.
+
+`ClearData` takes `SiteDataCookies`, `SiteDataLocalStorage` (with session
+storage), `SiteDataIndexedDB` (with WebSQL), `SiteDataCaches` (the HTTP
+cache and Cache Storage), `SiteDataServiceWorkers`, or `SiteDataAll`: all
+the data the engine keeps for sites, those kinds and the others it has.
+
+| | persistent session | ephemeral session |
+|---|---|---|
+| macOS | `WKWebsiteDataStore dataStoreForIdentifier:` with a UUID made of the name, from macOS 14; before, an in-memory store that lasts until the app quits | `nonPersistentDataStore` |
+| Linux | a web context of its own, with its data in `Sessions/<UUID>` of the user data directory and its caches in that of the cache directory; WebKitGTK 2.16 or newer | a web context with an ephemeral website data manager |
+| Windows | a WebView2 profile, `mygo-<UUID>`, in the app's WebView2 user data; WebView2 Runtime 1.0.1185 or newer | an InPrivate profile, `mygo-private-<n>`, which WebView2 drops with its last web view |
+
+On Windows, the cookies of a session come from a web view of its profile,
+as the default session's do: before one of its windows shows a page, the
+calls make a hidden one.

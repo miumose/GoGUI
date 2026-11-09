@@ -3,9 +3,11 @@ package ui
 import (
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 
@@ -101,23 +103,100 @@ func TestBufferSetUTF8(t *testing.T) {
 }
 
 func TestBufferWords(t *testing.T) {
-	s := "one, two_3\n  four\n\nfive"
-	var b buffer
-	b.set(s)
-	var tb text.Boundaries
-	tb.Reset([]rune(s))
-	for i := 0; i <= b.n; i++ {
-		if got, want := b.nextWord(i), tb.NextWord(i); got != want {
-			t.Errorf("nextWord(%d) = %d, want %d", i, got, want)
+	for _, s := range []string{
+		"one, two_3\n  four\n\nfive",
+		"今天天气很好，我们去公园散步\nGo语言 is fun",
+		"今日は直接骨を見た。カタカナー",
+		"한국어 문장, abc",
+	} {
+		var tb text.Boundaries
+		tb.Reset([]rune(s))
+		for _, indexed := range []bool{false, true} {
+			var b buffer
+			if indexed {
+				b.setSnapshot(NewTextBuffer(s).Snapshot())
+			} else {
+				b.set(s)
+			}
+			for i := 0; i <= b.n; i++ {
+				if got, want := b.nextWord(i), tb.NextWord(i); got != want {
+					t.Errorf("%q indexed %v: nextWord(%d) = %d, want %d", s, indexed, i, got, want)
+				}
+				if got, want := b.prevWord(i), tb.PrevWord(i); got != want {
+					t.Errorf("%q indexed %v: prevWord(%d) = %d, want %d", s, indexed, i, got, want)
+				}
+				gs, ge := b.wordAt(i)
+				ws, we := tb.WordAt(i)
+				if gs != ws || ge != we {
+					t.Errorf("%q indexed %v: wordAt(%d) = %d, %d, want %d, %d", s, indexed, i, gs, ge, ws, we)
+				}
+			}
 		}
-		if got, want := b.prevWord(i), tb.PrevWord(i); got != want {
-			t.Errorf("prevWord(%d) = %d, want %d", i, got, want)
+	}
+}
+
+// TestTextInputCJKWords deletes, moves and selects by words in Chinese
+// and Japanese, which have no spaces between them: a character at a time,
+// not the whole run (#668).
+func TestTextInputCJKWords(t *testing.T) {
+	word := Ctrl
+	if runtime.GOOS == "darwin" {
+		word = Alt
+	}
+	typed := func(s string) (*Tester, *string) {
+		t.Helper()
+		v := ""
+		tt := NewTester(func(c *Context) {
+			Column(c).Fill().Padding(20).Children(func() {
+				TextInput(c, &v).AutoFocus().Label("field").Width(400)
+			})
+		}, 500, 120)
+		tt.Frame()
+		tt.Type(s)
+		if v != s {
+			t.Fatalf("typed %q, field has %q", s, v)
 		}
-		gs, ge := b.wordAt(i)
-		ws, we := tb.WordAt(i)
-		if gs != ws || ge != we {
-			t.Errorf("wordAt(%d) = %d, %d, want %d, %d", i, gs, ge, ws, we)
+		return tt, &v
+	}
+	for _, c := range []struct{ s, want string }{
+		{"hello brave new world", "hello brave new "},
+		{"今天天气很好，我们去公园散步", "今天天气很好，我们去公园散"},
+		{"今日は直接骨を見た", "今日は直接骨を見"},
+		{"한국어 문장", "한국어 "},
+		{"Go语言", "Go语"},
+	} {
+		tt, v := typed(c.s)
+		tt.Key(word, KeyBackspace)
+		if *v != c.want {
+			t.Errorf("word backspace in %q leaves %q, want %q", c.s, *v, c.want)
 		}
+	}
+	for _, c := range []struct{ s, want string }{
+		{"hello brave new world", "hello brave new |world"},
+		{"我们去公园散步", "我们去公园散|步"},
+		{"abc语言", "abc语|言"},
+	} {
+		tt, v := typed(c.s)
+		tt.Key(word, KeyLeft)
+		tt.Type("|")
+		if *v != c.want {
+			t.Errorf("word left in %q, then |: %q, want %q", c.s, *v, c.want)
+		}
+	}
+	// A double click inside the text selects one character.
+	s := "我们去公园散步吧"
+	tt, _ := typed(s)
+	r, ok := tt.Find("field")
+	if !ok {
+		t.Fatal("no field")
+	}
+	x, y := r.X+12+float32(utf8.RuneCountInString(s))*4, r.Y+r.H/2
+	tt.ClickAt(x, y)
+	tt.Advance(50 * time.Millisecond)
+	tt.ClickAt(x, y)
+	tt.Command("copy")
+	if got := tt.Clipboard(); utf8.RuneCountInString(got) != 1 || !strings.Contains(s, got) {
+		t.Errorf("double click in %q selects %q, want one character", s, got)
 	}
 }
 
@@ -361,6 +440,42 @@ func TestTextAreaSelectsAsWholeText(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestTextAreaDragReleaseBeforeFrame selects as far as the pointer let go
+// before a frame showed its last moves, as a drag with frames between its
+// moves does.
+func TestTextAreaDragReleaseBeforeFrame(t *testing.T) {
+	s := "a line of text to select by dragging"
+	tt := coreNewTester(func(c *context) { coreTextArea(c, &s).Fill() }, 400, 300)
+	tt.Press(20, 15)
+	tt.Move(80, 15)
+	tt.Move(140, 15)
+	tt.Release(140, 15)
+	ed := textAreaState(tt).editor
+	want := ed.caret
+	tt.Advance(time.Second)
+	tt.Press(20, 15)
+	tt.Move(80, 15)
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.PointerMove, X: 110, Y: 15})
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.PointerUp, X: 140, Y: 15})
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.PointerMove, X: 60, Y: 15})
+	tt.settle()
+	if ed.caret != want {
+		t.Errorf("let go before a frame: selected to %d, want %d as with frames", ed.caret, want)
+	}
+	// Right, pressed after the release before a frame, collapses the
+	// selection where the drag ended, and the drag selects no more.
+	tt.Advance(time.Second)
+	tt.Press(20, 15)
+	tt.Move(80, 15)
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.PointerUp, X: 140, Y: 15})
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.KeyPressed, Key: platform.Key(KeyRight)})
+	tt.rt.event(platform.SurfaceEvent{Kind: platform.KeyReleased, Key: platform.Key(KeyRight)})
+	tt.Frame()
+	if ed.anchor != want || ed.caret != want {
+		t.Errorf("Right after letting go before a frame: selected %d to %d, want the caret at %d", ed.anchor, ed.caret, want)
 	}
 }
 

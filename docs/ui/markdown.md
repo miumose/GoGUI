@@ -46,9 +46,10 @@ neither parsed nor laid out again.
 
 The end of a reply shows what its syntax will most likely become, as
 the chat apps show it, without changing its text: `**bol` is bold, an
-unclosed code span is code, `[the docs](https://ex` is a link whose
-destination is still coming (not clickable yet), and an open code fence
-shows as code. Lines that could still turn into something else wait for
+unclosed code span is code, `$$x_i` (and `$x_i` with `ExtDollarMath`)
+is math, whose `_` and `*` are TeX rather than emphasis,
+`[the docs](https://ex` is a link whose destination is still coming (not
+clickable yet), and an open code fence shows as code. Lines that could still turn into something else wait for
 what follows them: a line of a few markers, as `-` or `==`, which would
 make the paragraph above a heading, and a table's header, which waits
 for its delimiter row so that it does not flash as a paragraph of pipes.
@@ -78,6 +79,35 @@ desktop's Reduce Motion. Text fades by its color and the rest of blocks
 (list markers, code blocks, a table's rows) by their opacity, which
 paint only: nothing is laid out again for it. What is still to reveal
 when the message switches to `View` keeps coming in.
+
+### Once a reply has shown
+
+The last bytes of a reply arrive before its last words show: the pace
+is still catching up, and they still fade in. `Revealed`, given the
+element `View` or `Stream` returned, reports whether it shows all of its
+text, done fading in, so that a chat shows a reply's time and actions
+then, not ahead of words still coming in:
+
+```go
+var md ui.Element
+if m.Done {
+	md = markdown.View(c, m.Text, &app.md)
+} else {
+	md = markdown.Stream(c, m.Text, &app.md)
+}
+if m.Done && markdown.Revealed(md) {
+	ui.Text(c, m.Time).TextColor(c.Theme().TextMuted)
+}
+```
+
+It tells what the frame shows: read it after the view, and build what it
+decides below it. The view asks for frames while it reveals and fades,
+so the time shows on its own once the fade ends. Text that shows at once
+(`AtOnce`, a `View` of text no `Stream` left to reveal) is revealed in
+its first frame, and without a fade (a negative `Fade`, Reduce Motion)
+once its last word shows. More text makes it false again. Of a `Stream`
+it tells only that what came so far shows, so check that the reply is
+complete too, as `m.Done` above.
 
 ## A chat
 
@@ -126,6 +156,66 @@ instead:
 
 ```go
 app.md.OnLink = func(url string) { app.open(url) }
+```
+
+`LinkMenu` gives each link a [context menu](context-menu.md) of its own,
+given its destination, as a chat whose replies link files offers Copy
+Path and Reveal in Finder for the file right-clicked. The link's menu
+replaces the one around the view, as its `Selectable` container's, and
+`EditItems` puts the text's Copy and Select All back in it; links to
+`#a-heading`, footnote references and a link whose destination is still
+coming keep the menu around them:
+
+```go
+app.md.LinkMenu = func(m *ui.Menu, url string) {
+	if m.Item("Copy Path").Chosen() {
+		app.copyPath(url)
+	}
+	if m.Item("Reveal in Finder").Chosen() {
+		app.reveal(url)
+	}
+	m.Separator()
+	m.EditItems()
+}
+```
+
+`Anchor` opens a document at a heading, given its slug with or without
+the `#`: a docs reader that opens `guide.md#install` from a search hit,
+or that comes back where its user was. The view scrolls to it as the
+document shows, as another document replaces it and as `Anchor`
+changes; `AnchorVersion` asks for the same heading again. An `OnLink`
+that handles `#a-heading` links sets it:
+
+```go
+app.md.OnLink = func(url string) {
+	if strings.HasPrefix(url, "#") {
+		app.md.Anchor = url
+		app.md.AnchorVersion++
+		return
+	}
+	app.open(url)
+}
+```
+
+`LinkIcon` puts an icon at the start of a link's text, from its
+destination and the size of the text around it: a box as `InlineMath`
+makes, which clicks as the link and stays on the line of its first
+word. It copies as nothing, as text, HTML and Markdown. When it returns
+false, the link has none; a link still streaming in has none yet. Links
+take their color from `Theme.Link`:
+
+```go
+app.md.LinkIcon = func(dest string, size float32) (markdown.InlineObject, bool) {
+	if !strings.HasPrefix(dest, "http") {
+		return markdown.InlineObject{}, false
+	}
+	return markdown.InlineObject{
+		Width: size * 1.2, Height: size * 0.86, Depth: size * 0.14,
+		Draw: func(p *ui.Painter, r ui.Rect) {
+			p.Icon(globe, ui.Rect{X: r.X, Y: r.Y, W: size, H: size}, app.md.Theme.Link)
+		},
+	}, true
+}
 ```
 
 Images show their description until `LoadImage` loads them, on a
@@ -178,7 +268,26 @@ Math between `$$` and `$$`, `\[` and `\]`, or `\(` and `\)` shows as its
 TeX in the code font, as language models write it; `$…$` too with the
 `ExtDollarMath` extension, except where the dollars read as money.
 `Math` builds blocks of display math instead, as with a renderer of
-your own.
+your own; a block still streaming is `Open` to `Block`, which can show
+its TeX until it closes.
+
+`InlineMath` makes math within text an object of the paragraph, from
+its TeX and the size of the text around it: a box `Width` wide,
+`Height` above the baseline and `Depth` below it, which wraps with the
+words and which `Draw` paints. Copied, as text or Markdown, it is its
+source, as `$x_i$`. When it returns false, the math shows as TeX. It is
+asked whenever its paragraph changes, as each frame of one streaming in,
+so keep what it makes:
+
+```go
+app.md.InlineMath = func(tex string, size float32) (markdown.InlineObject, bool) {
+	f, err := app.formula(tex, size) // laid out once, kept by TeX and size
+	if err != nil {
+		return markdown.InlineObject{}, false
+	}
+	return markdown.InlineObject{Width: f.W, Height: f.Ascent, Depth: f.Descent, Draw: f.Draw}, true
+}
+```
 
 Raw HTML shows as text, so that a reply cannot hide anything. Within
 text, the tags of formatting that models write (`<b>`, `<i>`, `<u>`,
@@ -211,7 +320,9 @@ weight, color, spacing and rule; list indentation; block quotes' bar and
 text; code blocks' background, border, corners, padding and token colors
 (an `editor.Theme`); tables' lines, header, stripes, padding and widest
 column; marked text; and check boxes. Lengths are in ems, times the font
-size, so that a theme scales with it.
+size, so that a theme scales with it. `LinkWeight` is the least weight of
+links' text, for links that read as links where color alone doesn't, in a
+gray print theme or to a colorblind reader.
 
 `Block` replaces how any block shows: it is asked first for each block,
 and builds it when it returns true, from the document's blocks and
@@ -271,6 +382,13 @@ It passes all 652 examples of the CommonMark 0.31.2 spec and those of
 GitHub's extensions, takes linear time on the inputs that are slow in
 other parsers, as cmark does, and depends on nothing outside the
 standard library.
+
+One rule is relaxed for Chinese, Japanese and Korean, which put no space
+around emphasis: next to a CJK character, full-width punctuation or a
+curly quote, `*` and `~~` open and close even where punctuation would
+stop them in CommonMark, so `**结论。**后文` is bold. `_` and a single `~`
+keep CommonMark's rule. No example of the spec has CJK text there, so
+all of them still pass.
 
 ## Performance
 

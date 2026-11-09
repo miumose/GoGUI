@@ -70,7 +70,11 @@ behaves and to move it:
   does; scrolling back to the end follows it again. `FollowAnimation`
   makes it glide there, as a spring (`&ui.Smooth`) or a curve, rather
   than show the end at once: what is added comes up from below, as the
-  chat apps scroll, and the user scrolling stops it.
+  chat apps scroll, and the user scrolling stops it. Each layout reads
+  `FollowEnd` as it is then, and `HoldPlace` keeps the list where it is
+  for the next layout alone: call it in the frame a click opens a fold in
+  the last message, and the line clicked stays under the pointer rather
+  than following the end as the row grows.
 - `Header` names the rows heading sections: the header of the section at
   the top stays pinned there while its rows scroll under it, until the next
   header pushes it away. Give headers a background.
@@ -86,7 +90,12 @@ building the list.
 - `Selected` lets a click, or Up, Down, Home and End while the list has the
   keyboard focus (and Page Up and Page Down on Linux and Windows), choose a
   row, which shows in the accent color; the list's `Changed` reports a new
-  choice, and `Submitted` a double click or Enter.
+  choice, and `Submitted` a double click or Enter. `-1` is no row chosen.
+  With a `Key`, the choice follows its item as rows are added, removed or
+  sorted, and becomes `-1` when its item leaves the rows. The list writes
+  that as it builds, in the same pass, so what you build after the list
+  (a detail panel reading the chosen row) must take `-1` as none. Without
+  a `Key`, the choice stays at its index.
 - `Selection` lets the user choose several rows, held in a
   `ui.Selection[K]` by the keys of their items (`Key`), or by their indices
   without one: a click chooses one, Cmd-click (Ctrl-click on Linux and
@@ -95,6 +104,23 @@ building the list.
   Linux and Windows, Ctrl with the keys moves without choosing, and
   Ctrl+Space adds the row there or takes it out. `Selected`, set as well, is
   the row last chosen.
+
+A table and the editor of its chosen row below it:
+
+```go
+app.list.Key = func(i int) any { return app.cols[i].Name }
+app.list.Selected = &app.colRow
+ui.List(c, &app.list, len(app.cols), func(i int) {
+	ui.Text(c, app.cols[i].Name).Padding(6, 12)
+}).Grow(1)
+if app.colRow >= 0 { // -1 once another table's columns replaced the chosen one
+	columnEditor(c, &app.cols[app.colRow])
+}
+```
+
+When the same list shows another set of rows, as another table's, start
+its state afresh (`app.list = ui.ListState{}`) so that it forgets the item
+chosen before and the place it scrolled to.
 
 Files to choose several of, by their paths:
 
@@ -132,6 +158,11 @@ is. `MenuKeepsSelection` turns this off: the menu opens on the row clicked,
 whose builder knows its row, and the choice stays. A list with `Selected`
 alone never chooses on a right-click.
 
+The menu key and Shift+F10 open the context menu of the row chosen, below
+the row, while the list has the focus: the outermost element with a
+`ContextMenu` in the row, or the list's own when no row is chosen or the
+row has none.
+
 ```go
 app.files.Selection = &app.chosen
 app.files.MenuKeepsSelection = true // the menu acts on the row clicked alone
@@ -146,7 +177,7 @@ down, as a spreadsheet does, rather than at the release; a press on a row
 chosen waits for the release, so a drag of the choice keeps it.
 `DragSelecting` reports a drag choosing rows while the pointer holds it, for
 work that follows the choice, as a sum of the rows chosen, to wait until it
-ends. A list cannot both `DragSelect` and `Reorder`.
+ends. A list cannot both `DragSelect` and `Reorder` (or `DragRows`).
 
 `ExtendTo(row)` chooses the rows from the one Shift extends from to `row`,
 as a Shift-click on it does, for keys of your own, as one that extends the
@@ -172,6 +203,55 @@ ui.List(c, &app.list, len(app.files), func(i int) {
 	}
 })
 ```
+
+`RowClicked` reports a single click the same way, for rows that act on one,
+as a file list opening a file or a sidebar its page, with no button inside
+the row taking the click: the row takes it, so its `Label` names what takes
+the click, for typing its first letters, screen readers and `Tester.Click`
+alike. It reports each click of the primary button without modifiers, on the
+row already chosen too, where `Changed` reports nothing new. The keys moving
+the choice report none, nor does a Shift- or Cmd-click extending it. A double
+click reports its first click with `RowClicked` and its second with
+`RowDoubleClicked`, as the systems' lists do. Assistive technology pressing
+the row reports it to the first element of the row asking, and in a list
+that does not choose its rows, asking makes the row take the click.
+
+```go
+ui.List(c, &app.sidebar, len(app.pages), func(i int) {
+	if ui.Text(c, app.pages[i].Title).Padding(6, 12).FillWidth().RowClicked() {
+		app.show(i)
+	}
+})
+```
+
+Rows that draw their own hover and press, as a chat list's, ask the row
+built with `Rows` rather than an element of their own: `ListRow`'s
+`Hovered`, `Pressed` and `PointerPosition` report the row's, as the
+row's element would. `Pressed` or `Hovered` on an element inside the row
+would make that element take the press, and the row would not choose,
+nor would `Tester.Click` on the row's `Label` reach it. A press starts a
+ripple where the pointer went down:
+
+```go
+ui.List(c, &app.chats, len(app.items)).Grow(1).Rows(func(row ui.ListRow) {
+	bg := ui.Transparent
+	switch {
+	case row.Pressed():
+		bg = row.Context.Theme().SurfacePressed
+		if app.ripple.Row != row.Index {
+			x, y, _ := row.PointerPosition()
+			app.ripple = Ripple{Row: row.Index, X: x, Y: y, At: time.Now()}
+		}
+	case row.Hovered():
+		bg = row.Context.Theme().SurfaceHover
+	}
+	ui.Box(row.Context).Background(bg).Padding(8, 12).Children(func() {
+		ui.Text(row.Context, app.items[row.Index].Title)
+	})
+})
+```
+
+In a list that chooses no rows, `Pressed` makes the row take the press.
 
 ## Scrolling
 
@@ -217,6 +297,28 @@ Rows that are buttons, which open what they show as they are clicked,
 reorder too: a press on a row's button drags the row once the pointer
 moves, and clicks the button if it does not.
 
+## Dragging rows out
+
+`DragRows` lets the user drag rows out of the list, to drop them elsewhere:
+the rows chosen, when the row dragged is one of them, else that row, drag
+the value `DragRows` returns, which `ui.Drop` and `ui.DragOver` take as
+they take any value dragged. The list itself takes nothing and shows no
+line between its rows, so a target inside it, as a folder in a list of
+files, or one around it, gets the value wherever the pointer is:
+
+```go
+app.files.DragRows = func(rows []int) any {
+	return app.pathsOf(rows) // []string
+}
+// In the row of a folder:
+if paths, ok := ui.Drop[[]string](row); ok {
+	app.move(paths, folder)
+}
+```
+
+Return nil for rows that do not drag. A list cannot both `Reorder` and
+`DragRows`.
+
 See [drag and drop](drag-and-drop.md).
 
 ## The focus
@@ -241,7 +343,8 @@ Call `app.list.Handle.Focus()` on the UI thread to request focus, or
 list and `FocusWithin(c)` includes its descendants. A handle's shortcut
 action runs after construction only if its enabled control is present.
 
-`ListRow` supplies the current Context, row index, selection and list focus.
+`ListRow` supplies the current Context, row index, selection and list focus,
+and the row's hover and press (see [choosing rows](#choosing-rows)).
 `ListState.Selected` or `Selection` enables selection. `ItemKey` gives each
 item a stable key. Configure them before calling Rows.
 
@@ -262,6 +365,8 @@ the rows it is, "5 of 10,000", although the list builds only those in view.
 A list choosing its rows gives assistive technology the focus on the row
 chosen: Up and Down are read as they move the choice, and focusing a row
 chooses it. A screen reader moving out of view asks the list to scroll
-there, which builds the rows it reaches.
+there, which builds the rows it reaches. A list of rows of cells, as a
+spreadsheet's, is a [grid](accessibility.md#grids) with
+`Role(ui.RoleGrid)`: its rows are then rows of a table.
 
 For rows in columns, see [Table](table.md); for a tree, [Outline](outline.md).

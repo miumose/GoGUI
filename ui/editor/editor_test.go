@@ -2,10 +2,16 @@ package editor
 
 import (
 	"bytes"
+	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/egoist/mygo/internal/rope"
+	"github.com/egoist/mygo/internal/text"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -205,6 +211,127 @@ func TestCodeEditorScrollbar(t *testing.T) {
 	ct.want("|" + strings.Repeat("x", 200))
 }
 
+// TestCodeEditorAutoscroll checks that a selection dragged past the
+// text's right or left edge scrolls the editor that way.
+func TestCodeEditorAutoscroll(t *testing.T) {
+	ct := newEditorTest(t, "", "|"+strings.Repeat("x", 200))
+	ct.tt.Press(300, 5)
+	ct.tt.Move(650, 5)
+	ct.tt.Advance(time.Second)
+	right := ct.st.ed.scrollX
+	if right <= 0 {
+		t.Fatal("dragging past the right edge did not scroll")
+	}
+	if sel := ct.st.Selections()[0]; sel.Head <= sel.Anchor {
+		t.Fatalf("selection %+v, want it to grow to the right", sel)
+	}
+	ct.tt.Move(5, 5)
+	ct.tt.Advance(time.Second)
+	ct.tt.Release(5, 5)
+	if ct.st.ed.scrollX >= right {
+		t.Fatal("dragging over the gutter did not scroll back")
+	}
+}
+
+// TestCodeEditorScrollbarOnHover checks that the scroll bar's thumb
+// shows while the pointer is over the editor, as a scroll container's
+// does, and not otherwise, and over no track.
+func TestCodeEditorScrollbarOnHover(t *testing.T) {
+	ct := newEditorTest(t, "go", "|package main\n\nfunc main() {}\n")
+	thumb := func() bool {
+		img := ct.tt.Image()
+		s := img.Bounds().Dx() / 600
+		x, y := (600-scrollbarWidth/2)*s, 5*s
+		return img.RGBAAt(x, y) != img.RGBAAt(x-scrollbarWidth*s, y)
+	}
+	ct.tt.Frame()
+	if thumb() {
+		t.Fatal("the thumb shows with the pointer away")
+	}
+	ct.tt.Move(300, 200)
+	ct.tt.Frame()
+	if !thumb() {
+		t.Fatal("the thumb doesn't show with the pointer over the editor")
+	}
+	ct.tt.Move(-10, -10)
+	ct.tt.Frame()
+	if thumb() {
+		t.Fatal("the thumb stayed as the pointer left")
+	}
+	// Over the bar, the thumb and no track: below the thumb, the bar is
+	// the editor's background.
+	x := float32(600 - scrollbarWidth/2)
+	ct.tt.Move(x, 5)
+	ct.tt.Frame()
+	img := ct.tt.Image()
+	s := img.Bounds().Dx() / 600
+	if img.RGBAAt(int(x)*s, 390*s) != img.RGBAAt((int(x)-scrollbarWidth)*s, 390*s) {
+		t.Error("the bar shows a track under its thumb")
+	}
+}
+
+// TestCodeEditorKeepScrollbars checks that KeepScrollbars shows the
+// thumb with the pointer away, as it shows on hover, and that
+// NoScrollbars shows no bar, takes no press on it and leaves its room to
+// the text, while the wheel still scrolls.
+func TestCodeEditorKeepScrollbars(t *testing.T) {
+	ct := newEditorTest(t, "go", "|package main\n\nfunc main() {}\n")
+	bar := func() []uint32 {
+		img := ct.tt.Image()
+		s := img.Bounds().Dx() / 600
+		var px []uint32
+		for y := 0; y < 400*s; y++ {
+			for x := (600 - scrollbarWidth) * s; x < 600*s; x++ {
+				c := img.RGBAAt(x, y)
+				px = append(px, uint32(c.R)<<24|uint32(c.G)<<16|uint32(c.B)<<8|uint32(c.A))
+			}
+		}
+		return px
+	}
+	ct.tt.Move(-10, -10)
+	ct.tt.Frame()
+	none := bar()
+	ct.st.KeepScrollbars = true
+	ct.tt.Frame()
+	away := bar()
+	if slices.Equal(away, none) {
+		t.Fatal("a kept thumb doesn't show with the pointer away")
+	}
+	ct.tt.Move(300, 200)
+	ct.tt.Frame()
+	if hovered := bar(); !slices.Equal(away, hovered) {
+		t.Fatal("a kept thumb looks otherwise with the pointer away than on hover")
+	}
+	ct.st.KeepScrollbars = false
+	ct.st.NoScrollbars = true
+	ct.tt.Frame()
+	if v, h := ct.st.ed.scrollbars(); v || h || ct.st.ed.trackWidth() != 0 {
+		t.Fatalf("NoScrollbars: bars %v %v, room %v", v, h, ct.st.ed.trackWidth())
+	}
+	if !slices.Equal(bar(), none) {
+		t.Fatal("NoScrollbars painted a bar on hover")
+	}
+	x := float32(600 - scrollbarWidth/2)
+	ct.tt.Move(x, 5)
+	if c := ct.tt.Cursor(); c != ui.CursorText {
+		t.Fatalf("cursor where the bar was %v, want the I-beam", c)
+	}
+	ct.tt.Press(x, 5)
+	ct.tt.Move(x, 300)
+	ct.tt.Release(x, 300)
+	if ct.st.ScrollY() != 0 {
+		t.Fatal("dragging where the bar was scrolled")
+	}
+	ct.tt.Scroll(300, 200, 0, 20)
+	ct.tt.Frame()
+	if ct.st.ScrollY() != 20 {
+		t.Fatalf("the wheel scrolled to %v without bars, want 20", ct.st.ScrollY())
+	}
+	if ct.st.ViewportHeight() != 400 {
+		t.Fatalf("ViewportHeight %v, want 400", ct.st.ViewportHeight())
+	}
+}
+
 func TestCodeEditorMultiCursor(t *testing.T) {
 	ct := newEditorTest(t, "go", "foo := 1\nbar := foo\nfoo++")
 	ct.st.Select(0, 0)
@@ -400,6 +527,72 @@ func TestCodeEditorFold(t *testing.T) {
 	}
 }
 
+// TestCodeEditorCJKWords moves and deletes by words in Chinese and
+// Japanese: a character at a time, as they have no spaces (#668).
+func TestCodeEditorCJKWords(t *testing.T) {
+	ct := newEditorTest(t, "", "|Go语言 今日は")
+	for _, want := range []string{"Go|语言 今日は", "Go语|言 今日は", "Go语言| 今日は", "Go语言 今|日は", "Go语言 今日|は", "Go语言 今日は|"} {
+		ct.run(MoveWordRight)
+		ct.want(want)
+	}
+	ct.run(MoveWordLeft)
+	ct.want("Go语言 今日|は")
+	ct.run(DeleteWordLeft)
+	ct.want("Go语言 今|は")
+	ct = newEditorTest(t, "", "我们去公园散步|")
+	ct.run(DeleteWordLeft)
+	ct.want("我们去公园散|")
+	ct.run(MoveSubwordLeft)
+	ct.want("我们去公园|散")
+}
+
+func TestCJKWordAt(t *testing.T) {
+	r := rope.TextOf(rope.Build("say 我们，ok"))
+	for _, c := range []struct{ off, a, z int }{
+		{0, 0, 3}, {4, 4, 7}, {5, 4, 7}, {7, 7, 10}, {10, 7, 10}, {13, 13, 15},
+	} {
+		if a, z := wordAt(r, c.off, ""); a != c.a || z != c.z {
+			t.Errorf("wordAt(%d) = %d, %d, want %d, %d", c.off, a, z, c.a, c.z)
+		}
+	}
+}
+
+func TestCodeEditorFoldImports(t *testing.T) {
+	for _, tc := range []struct {
+		lang, text string
+		want       []fold
+	}{
+		// A block in brackets alone folds by them, as before.
+		{"go", "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}", []fold{{2, 4}}},
+		// Several, to the closing line of the last.
+		{"go", "package main\n\nimport \"fmt\"\nimport (\n\t\"os\"\n)\n\nfunc main() {}", []fold{{2, 5}}},
+		// One import alone does not fold.
+		{"go", "package main\n\nimport \"fmt\"\n\nfunc main() {}", nil},
+		// A run of them, a long one in it, and blank lines between.
+		{"typescript", "// x\nimport a from './a'\nimport {\n  b,\n  c,\n} from './b'\n\nimport './d'\n\nconst e = a", []fold{{1, 7}}},
+		{"python", "\"\"\"Doc.\"\"\"\nimport os\nfrom x import (\n    a,\n)\nimport sys\n\nprint(os)", []fold{{1, 5}}},
+		{"rust", "use std::io;\npub use crate::x;\n\nfn main() {}", []fold{{0, 1}}},
+		{"c", "#include <stdio.h>\n#include \"x.h\"\n\nint main() {}", []fold{{0, 1}}},
+		{"java", "package a;\n\nimport a.B;\nimport a.C;\n\nclass D {}", []fold{{2, 3}}},
+		// Not the lines of a docstring.
+		{"python", "\"\"\"\nfrom here on\nimport this\n\"\"\"\nimport os\nimport sys\n", []fold{{4, 5}}},
+		{"go", "// import a\n// import b\npackage main\n", nil},
+		// None in a language without imports.
+		{"markdown", "import a\nimport b\n", nil},
+	} {
+		ct := newEditorTest(t, tc.lang, tc.text)
+		ct.st.FoldImports()
+		if got := ct.st.ed.folds; !slices.Equal(got, tc.want) {
+			t.Errorf("%s: folds %v, want %v", tc.lang, got, tc.want)
+		}
+	}
+	// The gutter marks the run's first line, not the others.
+	ct := newEditorTest(t, "javascript", "import a from 'a'\nimport b from 'b'\nimport c from 'c'\n\nf(a, b, c)")
+	if !ct.st.ed.foldable(0) || ct.st.ed.foldable(1) {
+		t.Errorf("foldable %v %v, want the first line only", ct.st.ed.foldable(0), ct.st.ed.foldable(1))
+	}
+}
+
 func TestCodeEditorWords(t *testing.T) {
 	ct := newEditorTest(t, "", "|fooBar_baz qux")
 	ct.run(MoveSubwordRight)
@@ -453,6 +646,19 @@ func TestCodeEditorWords(t *testing.T) {
 	ct.want("[FooBarBaz]")
 }
 
+func TestCodeEditorBracketsFar(t *testing.T) {
+	// 70 KB in 71 lines: past the 64 KB bound, within the 1000 lines.
+	far := strings.Repeat(strings.Repeat("x", 1000)+"\n", 70)
+	for _, text := range []string{"f(\n" + far + "|)", "f(|\n" + far + ")", "f(\n" + far + ")|"} {
+		ct := newEditorTest(t, "go", text)
+		at := ct.st.Selections()[0].Head
+		ct.run(MoveToBracket)
+		if got := ct.st.Selections()[0].Head; got != at {
+			t.Errorf("caret at %d moved to %d", at, got)
+		}
+	}
+}
+
 // Two editors of one buffer follow each other's edits.
 func TestCodeEditorSharedBuffer(t *testing.T) {
 	buf := NewBuffer("hello world")
@@ -488,4 +694,339 @@ func TestCodeEditorMultiClick(t *testing.T) {
 	ct.tt.ClickAt(x, y)
 	ct.tt.Frame()
 	ct.want("[select customers from orders\n]x")
+}
+
+// Soft wraps of long lines are measured a few lines a frame, as the
+// budget allows, rather than all at once, and every frame measures some.
+func TestCodeEditorWrapLongLines(t *testing.T) {
+	ct := newEditorTest(t, "", strings.Repeat(strings.Repeat("word ", 20_000)+"\n", 10))
+	ct.st.SoftWrap = true
+	ct.tt.Frame()
+	v := &ct.st.ed.view
+	// Measure again, as after a resize, with a budget spent from the start.
+	v.setWrap(true, v.wrapWidth-10)
+	if v.measureWraps(0, -1) {
+		t.Fatal("measured all the long lines at once")
+	}
+	for calls := 2; !v.measureWraps(0, -1); calls++ {
+		if calls > v.text.LineCount() {
+			t.Fatalf("lines not all measured after %d calls", calls)
+		}
+	}
+}
+
+// contextSpaced shapes as Core Text does text in Chinese, the app's
+// language, in ways a character shaped alone does not show: it leaves a
+// quarter of an em between Han and Latin letters, given to the advance of
+// the one before as penAdvances does, and CJK punctuation that ends a
+// text takes half its width. on tells whether it does.
+func contextSpaced(on func() bool) func(text.Params) *text.Layout {
+	han := func(r rune) bool { return r >= 0x4e00 && r <= 0x9fff }
+	latin := func(r rune) bool { return r < 0x80 && (unicode.IsLetter(r) || unicode.IsDigit(r)) }
+	return func(p text.Params) *text.Layout {
+		l := text.Shared().Shape(p)
+		if !on() {
+			return l
+		}
+		out := *l
+		out.Lines = slices.Clone(l.Lines)
+		out.Width = 0
+		room := p.Style.FontSize() / 4
+		for li := range out.Lines {
+			line := &out.Lines[li]
+			gs := slices.Clone(line.Glyphs)
+			shift := float32(0)
+			for k := range gs {
+				g := &gs[k]
+				g.X += shift
+				r := l.Runes[g.Cluster]
+				if k+1 < len(gs) {
+					if next := l.Runes[gs[k+1].Cluster]; han(r) && latin(next) || latin(r) && han(next) {
+						g.Advance += room
+						shift += room
+					}
+				} else if strings.ContainsRune("，。、；：！？", r) {
+					g.Advance /= 2
+					shift -= g.Advance
+				}
+			}
+			line.Glyphs = gs
+			line.Width += shift
+			out.Width = max(out.Width, line.X+line.Width)
+		}
+		return &out
+	}
+}
+
+// useShaper shapes the editors' text with shape until the test ends.
+func useShaper(t *testing.T, shape func(text.Params) *text.Layout) {
+	old := shapeText
+	shapeText = shape
+	t.Cleanup(func() { shapeText = old })
+}
+
+// checkRowsFit fails when a row of a line of v, shaped as it is painted,
+// is wider than the editor.
+func checkRowsFit(t *testing.T, v *view) {
+	t.Helper()
+	for n := range v.text.LineCount() {
+		l := v.line(n)
+		for ri := range l.rows {
+			r := &l.rows[ri]
+			for pi := range r.pieces {
+				p := &r.pieces[pi]
+				if end := r.indent + p.x + v.piece(l, p).Width; end > v.wrapWidth+1e-3 {
+					t.Errorf("at %v: row %d of line %d, %q, ends at %v", v.wrapWidth, ri, n, l.disp[r.from:r.to], end)
+				}
+			}
+		}
+	}
+}
+
+// chineseText is Chinese text of #1576: Han characters alone, prose with
+// punctuation, Han and Latin letters mixed, and those indented.
+const chineseText = "城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城城\n" +
+	"这是一段用于测试软换行的中文文本，每一行都含有若干标点符号。逗号、顿号和句号在中文排版中占一个全角字宽；分号与冒号：同样如此。标点越多，行尾超出编辑器右边界的部分就越明显，最后几个字会被裁掉。\n" +
+	"城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a\n" +
+	"    城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a城a"
+
+// The room the text engine leaves between characters in context, as Core
+// Text does between Han and Latin letters and around CJK punctuation in
+// Chinese text, which no character shaped alone has, keeps wrapped rows
+// within the editor (#1576).
+func TestCodeEditorWrapContextSpacing(t *testing.T) {
+	useShaper(t, contextSpaced(func() bool { return true }))
+	ct := newEditorTest(t, "", chineseText)
+	ct.st.SoftWrap = true
+	v := &ct.st.ed.view
+	for w := 300; w <= 600; w += 23 {
+		ct.tt.SetSize(w, 400)
+		ct.tt.Frame()
+		if len(v.line(2).rows) < 2 {
+			t.Fatalf("at %v: line 2 is not wrapped", v.wrapWidth)
+		}
+		checkRowsFit(t, v)
+	}
+}
+
+// Text without a language of its own, as the editor's, is shaped in the
+// app's language: when it changes, the rows are measured and shaped
+// again, in the spacing of the new one.
+func TestCodeEditorWrapLanguageChange(t *testing.T) {
+	sys := text.Shared()
+	t.Cleanup(func() { sys.SetLanguage("") })
+	sys.SetLanguage("")
+	useShaper(t, contextSpaced(func() bool { return sys.Language() == "zh-Hans" }))
+	ct := newEditorTest(t, "", strings.Repeat("城a", 80))
+	ct.st.SoftWrap = true
+	ct.tt.Frame()
+	v := &ct.st.ed.view
+	before := len(v.line(0).rows)
+	sys.SetLanguage("zh-Hans")
+	ct.tt.Frame()
+	if after := len(v.line(0).rows); after <= before {
+		t.Errorf("in Chinese, the line takes %d rows, as many as before (%d)", after, before)
+	}
+	checkRowsFit(t, v)
+}
+
+// Closing punctuation does not start a row, nor opening punctuation end
+// one: the row ends a character earlier (kinsoku).
+func TestCodeEditorWrapKinsoku(t *testing.T) {
+	ct := newEditorTest(t, "", strings.Repeat("城", 200))
+	ct.st.SoftWrap = true
+	ct.tt.Frame()
+	v := &ct.st.ed.view
+	l := v.line(0)
+	if len(l.rows) < 2 {
+		t.Fatal("not wrapped")
+	}
+	n := utf8.RuneCountInString(l.disp[:l.rows[0].to]) // Han characters a row holds
+	// Punctuation is narrower than a Han character in some fonts (as
+	// Windows' fallback for 「), so it is put a few places around the
+	// first break: at one of them a row would otherwise end before the
+	// closing punctuation, or after the opening one.
+	for _, c := range []struct {
+		punct string
+		// moved tells that the break was moved for the punctuation, from
+		// what the second row starts with.
+		moved func(second string) bool
+	}{
+		{"，", func(s string) bool { return strings.HasPrefix(s, "城，") }},
+		{"。」", func(s string) bool { return strings.HasPrefix(s, "城。」") }},
+		{"「", func(s string) bool { return strings.HasPrefix(s, "「城") }},
+		{",", func(s string) bool { return strings.HasPrefix(s, "城,") }},
+	} {
+		seen := false
+		for k := n - 3; k <= n+1; k++ {
+			src := strings.Repeat("城", k) + c.punct + "城城城"
+			ct.st.Buffer = NewBuffer(src)
+			ct.tt.Frame()
+			l := v.line(0)
+			if len(l.rows) < 2 {
+				continue
+			}
+			for ri, r := range l.rows {
+				row := l.disp[r.from:r.to]
+				first, _ := utf8.DecodeRuneInString(row)
+				last, _ := utf8.DecodeLastRuneInString(row)
+				if ri > 0 && (closing(first) || first == ',') || ri < len(l.rows)-1 && opening(last) {
+					t.Errorf("%q: row %d is %q", src, ri, row)
+				}
+			}
+			if c.moved(l.disp[l.rows[1].from:]) {
+				seen = true
+			}
+		}
+		if !seen {
+			t.Errorf("%q: no break was moved for it", c.punct)
+		}
+	}
+	const prose = "这是一段用于测试软换行的中文文本，每一行都含有若干标点符号。逗号、顿号和句号在中文排版中占一个全角字宽；分号与冒号：同样如此。“引号”与（括号）、《书名号》和【方括号】也不例外！"
+	ct.st.Buffer = NewBuffer(prose)
+	for w := 200; w <= 600; w += 7 {
+		ct.tt.SetSize(w, 400)
+		ct.tt.Frame()
+		l := v.line(0)
+		for ri, r := range l.rows {
+			row := l.disp[r.from:r.to]
+			first, _ := utf8.DecodeRuneInString(row)
+			last, _ := utf8.DecodeLastRuneInString(row)
+			if ri > 0 && closing(first) || ri < len(l.rows)-1 && opening(last) {
+				t.Errorf("at %v: row %d is %q", v.wrapWidth, ri, row)
+			}
+		}
+	}
+}
+
+// Tokens whose style is bold or italic are shaped in those faces, and
+// carets and hits find the same places across the runs of faces, on one
+// row and on a line wrapped into rows measured before they are shaped.
+func TestCodeEditorTokenFaces(t *testing.T) {
+	const line = "plain **strong** and *emph* téxt"
+	ct := newEditorTest(t, "markdown", line)
+	v := &ct.st.ed.view
+	l := v.line(0)
+	if len(l.faces) == 0 {
+		t.Fatalf("no faces for %q: %+v", line, l.toks)
+	}
+	lay := v.piece(l, &l.rows[0].pieces[0])
+	spans := text.DecodeSpans(lay.Params.Spans)
+	face := func(rune int) (weight int, italic bool) {
+		for _, sp := range spans {
+			if rune < sp.End {
+				return sp.Weight, sp.Italic
+			}
+		}
+		return 0, false
+	}
+	runeOf := func(sub string) int { return utf8.RuneCountInString(line[:strings.Index(line, sub)]) }
+	for _, c := range []struct {
+		sub    string
+		weight int
+		italic bool
+	}{{"plain", 0, false}, {"strong", 700, false}, {"and", 0, false}, {"emph", 0, true}, {"téxt", 0, false}} {
+		if w, it := face(runeOf(c.sub)); w != c.weight || it != c.italic {
+			t.Errorf("%q: weight %d, italic %v; want %d, %v", c.sub, w, it, c.weight, c.italic)
+		}
+	}
+	plain := newEditorTest(t, "", line)
+	pv := &plain.st.ed.view
+	pl := pv.line(0)
+	if s := pv.piece(pl, &pl.rows[0].pieces[0]).Params.Spans; len(pl.faces) != 0 || s != "" {
+		t.Errorf("plain text has faces %+v, spans %q", pl.faces, s)
+	}
+
+	check := func(v *view, l *lineLayout) {
+		t.Helper()
+		for ri := range l.rows {
+			r := &l.rows[ri]
+			prev := float32(-1)
+			for d := r.from; d < r.to; d++ {
+				if !utf8.RuneStart(l.disp[d]) {
+					continue
+				}
+				x := v.xOf(l, r, d)
+				if x <= prev {
+					t.Fatalf("row %d: x of %d is %v, after %v", ri, d, x, prev)
+				}
+				prev = x
+				if got := v.dispAt(l, r, x+0.5); got != d {
+					t.Fatalf("row %d: hit at x %v of %d is %d", ri, x, d, got)
+				}
+			}
+			if w := v.xOf(l, r, r.to) - r.indent; math.Abs(float64(w-r.width)) > 1 {
+				t.Errorf("row %d: shaped %v wide, measured %v", ri, w, r.width)
+			}
+		}
+	}
+	check(v, l)
+
+	ct.st.SoftWrap = true
+	ct.tt.Frame()
+	v.setWrap(true, v.runsWidth(line, nil, 0, len(line))/2)
+	l = v.line(0)
+	if len(l.rows) < 2 {
+		t.Fatalf("%d rows, want the line wrapped", len(l.rows))
+	}
+	check(v, l)
+}
+
+// An editor as high as its lines, in a scroll view, shows its caret as it
+// takes the focus, not its first line.
+func TestFitContentFocusRevealsCaret(t *testing.T) {
+	st := &State{Buffer: NewBuffer(strings.Repeat("line\n", 300)), FitContent: true}
+	var scroll ui.ScrollState
+	tt := ui.NewTester(func(c *ui.Context) {
+		ui.Scroll(c).Fill().TrackScroll(&scroll).Children(func() {
+			ui.Box(c).Height(400).Shrink(0)
+			View(c, st).Shrink(0)
+		})
+	}, 600, 400)
+	tt.Frame()
+	st.Select(200*5, 200*5)
+	tt.Frame()
+	tt.Key(0, ui.KeyTab)
+	tt.Frame()
+	if !st.Focused() {
+		t.Fatal("Tab didn't focus the editor")
+	}
+	lh := st.ed.view.lineHeight
+	top := 400 + float32(st.LineTop(200))
+	if scroll.Y > top || scroll.Y+400 < top+lh {
+		t.Fatalf("focused, the view scrolled to %v, which doesn't show the caret at %v", scroll.Y, top)
+	}
+}
+
+// TestCodeEditorNoScrollbarsCancelsDrag checks that hiding the bars while
+// a thumb is dragged lets the drag go: the pointer's moves scroll no
+// more.
+func TestCodeEditorNoScrollbarsCancelsDrag(t *testing.T) {
+	ct := newEditorTest(t, "", "|"+strings.Repeat("line\n", 200))
+	x := float32(600 - scrollbarWidth/2)
+	ct.tt.Move(x, 5)
+	ct.tt.Press(x, 5)
+	ct.tt.Move(x, 50)
+	if ct.st.ScrollY() <= 0 {
+		t.Fatal("dragging the thumb did not scroll")
+	}
+	ct.st.NoScrollbars = true
+	ct.tt.Frame()
+	before := ct.st.ScrollY()
+	ct.tt.Move(x, 300)
+	if ct.st.ed.scrollbar.active || ct.st.ScrollY() != before {
+		t.Fatalf("hidden bars kept the drag: active %v, scrolled from %v to %v", ct.st.ed.scrollbar.active, before, ct.st.ScrollY())
+	}
+	ct.tt.Release(x, 300)
+}
+
+// The zero heights measures as empty before anything marks it changed.
+func TestHeightsZeroValue(t *testing.T) {
+	var h heights
+	if got := h.total(); got != 0 {
+		t.Fatalf("total of the zero heights = %v, want 0", got)
+	}
+	if got := h.lineAt(10); got != 0 {
+		t.Fatalf("lineAt of the zero heights = %d, want 0", got)
+	}
 }

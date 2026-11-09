@@ -2,9 +2,9 @@ package richtext
 
 import (
 	"runtime"
-	"unicode"
 
 	"github.com/egoist/mygo/internal/rope"
+	"github.com/egoist/mygo/internal/text"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -13,6 +13,11 @@ const scrollbarWidth = 10
 // input takes the editor's input as it comes: keys, text, edit commands,
 // the pointer and the wheel.
 func (v *view) input(ev ui.InputEvent) bool {
+	// The app is asked first, before the editor takes the document's state
+	// and gives its own back: what the app does to the document is kept.
+	if ev.Kind == ui.InputKeyDown && v.opts.OnKey != nil && v.opts.OnKey(ev.Key, ev.Mods) {
+		return true
+	}
 	v.sync()
 	defer v.publish()
 	switch ev.Kind {
@@ -71,57 +76,56 @@ func (v *view) runeAt(i int) rune {
 	return r
 }
 
-func isWord(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' }
-
 // nextWord returns the end of the word after i; prevWord the start of the
-// word before it.
+// word before it. Each ideograph and kana is a word, as
+// text.WordBoundary has it.
 func (v *view) nextWord(i int) int {
-	n, word := v.shown.Len(), false
+	n, word, prev := v.shown.Len(), false, rune(0)
 	for ; i < n; i++ {
-		if isWord(v.runeAt(i)) {
-			word = true
-		} else if word {
+		r := v.runeAt(i)
+		if word && text.WordBoundary(prev, r) {
 			break
 		}
+		word, prev = word || text.IsWordRune(r), r
 	}
 	return i
 }
 
 func (v *view) prevWord(i int) int {
-	word := false
+	word, next := false, rune(0)
 	for ; i > 0; i-- {
-		if isWord(v.runeAt(i - 1)) {
-			word = true
-		} else if word {
+		r := v.runeAt(i - 1)
+		if word && text.WordBoundary(r, next) {
 			break
 		}
+		word, next = word || text.IsWordRune(r), r
 	}
 	return i
 }
 
 // wordAt returns the word, or the run of other runes, around i, within its
-// paragraph.
+// paragraph: an ideograph or a kana is a word alone.
 func (v *view) wordAt(i int) (int, int) {
 	n := v.shown.Len()
 	if n == 0 {
 		return 0, 0
 	}
 	i = max(0, min(i, n-1))
-	word := isWord(v.runeAt(i))
+	at := v.runeAt(i)
 	a, z := i, i
-	for a > 0 {
+	for next := at; a > 0; a-- {
 		r := v.runeAt(a - 1)
-		if r == '\n' || isWord(r) != word {
+		if r == '\n' || text.WordBoundary(r, next) {
 			break
 		}
-		a--
+		next = r
 	}
-	for z < n {
+	for prev := at; z < n; z++ {
 		r := v.runeAt(z)
-		if r == '\n' || isWord(r) != word {
+		if r == '\n' || z > i && text.WordBoundary(prev, r) {
 			break
 		}
-		z++
+		prev = r
 	}
 	return a, z
 }
@@ -542,8 +546,9 @@ func (v *view) press(ev ui.InputEvent) bool {
 		return true
 	}
 	i, aff := v.positionAt(x, y)
-	if ev.Clicks == 1 && ev.Mods&ui.Shift == 0 && i < v.shown.Len() {
-		v.pressLink = v.shown.AttributesAt(i).Link
+	v.pressPoint = ui.Point{X: ev.X, Y: ev.Y}
+	if ev.Clicks == 1 && ev.Mods&ui.Shift == 0 {
+		v.pressLink = v.linkAt(x, y)
 	}
 	v.dragging = true
 	v.hasDesired = false
@@ -573,7 +578,7 @@ func (v *view) move(ev ui.InputEvent) bool {
 		cursor := ui.CursorText
 		if _, box := v.taskBox(x, y); box || v.overScrollbar(ev.X) {
 			cursor = ui.CursorDefault
-		} else if i, _ := v.positionAt(x, y); i < v.shown.Len() && v.shown.AttributesAt(i).Link != "" {
+		} else if v.linkAt(x, y) != "" {
 			cursor = ui.CursorPointer
 		}
 		if cursor != v.cursor {
@@ -607,7 +612,8 @@ func (v *view) move(ev ui.InputEvent) bool {
 	default:
 		v.caret, v.affinity = i, aff
 	}
-	if i != v.dragStart[0] || v.dragUnit != 1 {
+	dx, dy := ev.X-v.pressPoint.X, ev.Y-v.pressPoint.Y
+	if i != v.dragStart[0] || v.dragUnit != 1 || dx*dx+dy*dy >= 16 {
 		v.pressLink = ""
 	}
 	v.reveal = true
@@ -626,7 +632,10 @@ func (v *view) release(ev ui.InputEvent) bool {
 	v.dragging = false
 	link := v.pressLink
 	v.pressLink = ""
-	if link != "" && v.caret == v.selAnchor {
+	// A press the system took opens no link.
+	x, y := v.contentPoint(ev.X, ev.Y)
+	dx, dy := ev.X-v.pressPoint.X, ev.Y-v.pressPoint.Y
+	if link != "" && v.caret == v.selAnchor && !ev.Canceled && dx*dx+dy*dy < 16 && v.linkAt(x, y) == link {
 		if v.opts.OnLink != nil {
 			v.opts.OnLink(link)
 		} else if ui.SafeToOpen(link) {
@@ -634,6 +643,35 @@ func (v *view) release(ev ui.InputEvent) bool {
 		}
 	}
 	return true
+}
+
+// Attachments occupy one rune, but either half of their drawn box opens
+// the link. Keep nearest-caret hit testing for selection alone.
+func (v *view) linkAt(x float32, y float64) string {
+	p, l, _ := v.layoutPositionAt(x, y)
+	if p < 0 {
+		return ""
+	}
+	pv := v.paraLayout(p)
+	ox, oy := v.origin(p)
+	for _, object := range pv.layout.Objects() {
+		if object.Rect.Contains(x-ox, float32(y-oy)) {
+			at := pv.runeOfUnit(object.Index)
+			start := v.caret - v.shown.paraStart(p)
+			if v.compose != "" && v.shown.paraAt(v.caret) == p && at >= start && at < start+len([]rune(v.compose)) {
+				return ""
+			}
+			return v.shown.AttributesAt(v.global(p, at)).Link
+		}
+	}
+	i := v.global(p, l)
+	if i < v.shown.Len() {
+		a := v.shown.AttributesAt(i)
+		if a.Attachment == nil {
+			return a.Link
+		}
+	}
+	return ""
 }
 
 // taskBox reports whether (x, y), in the content, is on the check box of
@@ -661,30 +699,18 @@ func (v *view) overScrollbar(x float32) bool {
 	return v.hs.top(len(v.paras)) > float64(v.viewH) && x >= v.rect.W-scrollbarWidth
 }
 
+// bar returns the scroll bar, in the element.
+func (v *view) bar() ui.Scrollbar {
+	return ui.Scrollbar{Box: ui.Rect{W: v.rect.W, H: v.rect.H}, View: v.viewH, Content: float32(v.hs.top(len(v.paras))), Offset: float32(v.scroll)}
+}
+
 // thumbBox returns the top and the height of the scroll bar's thumb, in
 // the element.
-func (v *view) thumbBox() (top, size float32) {
-	total := v.hs.top(len(v.paras))
-	track := v.rect.H - 4
-	size = max(24, track*float32(float64(v.viewH)/max(total, 1)))
-	room := float64(track - size)
-	at := 0.0
-	if max := total - float64(v.viewH); max > 0 {
-		at = v.scroll / max
-	}
-	return 2 + float32(room*at), size
-}
+func (v *view) thumbBox() (top, size float32) { return v.bar().Thumb() }
 
 // dragThumb scrolls as the thumb is dragged to y.
 func (v *view) dragThumb(y float32) {
-	_, size := v.thumbBox()
-	track := v.rect.H - 4 - size
-	total := v.hs.top(len(v.paras)) - float64(v.viewH)
-	if track <= 0 || total <= 0 {
-		return
-	}
-	f := float64((y - v.thumbGrab - 2) / track)
-	v.setScroll(max(0, min(f, 1)) * total)
+	v.setScroll(float64(v.bar().OffsetAt(y - v.thumbGrab)))
 }
 
 // menu builds the editor's context menu.

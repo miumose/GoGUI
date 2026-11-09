@@ -25,6 +25,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 )
@@ -68,8 +69,10 @@ var (
 
 // RegisterFormat registers a format for DecodeSound, OpenStream and
 // NewDecoder: magic is the start of its files, where '?' matches any
-// byte, and open returns a decoder reading r from its start. A package
-// for a format calls it in its init function.
+// byte, and open returns a decoder reading r from its start. A file that
+// starts with an ID3 tag is of the format its bytes after the tag match,
+// and its decoder reads it from the tag. A package for a format calls it
+// in its init function.
 func RegisterFormat(name, magic string, open func(r io.ReadSeeker) (Decoder, error)) {
 	formatsMu.Lock()
 	defer formatsMu.Unlock()
@@ -97,10 +100,19 @@ func NewDecoder(r io.ReadSeeker) (Decoder, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	var head [16]byte
+	var head, after [16]byte
 	n, err := io.ReadFull(r, head[:])
 	if err != nil && err != io.ErrUnexpectedEOF {
 		return nil, "", err
+	}
+	// An ID3 tag first, as MP3s have and some FLAC and AAC files too: the
+	// format is what follows it.
+	m := 0
+	if n >= 10 && string(head[:3]) == "ID3" {
+		size := int64(head[6]&0x7f)<<21 | int64(head[7]&0x7f)<<14 | int64(head[8]&0x7f)<<7 | int64(head[9]&0x7f)
+		if _, err := r.Seek(start+10+size, io.SeekStart); err == nil {
+			m, _ = io.ReadFull(r, after[:])
+		}
 	}
 	if _, err := r.Seek(start, io.SeekStart); err != nil {
 		return nil, "", err
@@ -108,13 +120,15 @@ func NewDecoder(r io.ReadSeeker) (Decoder, string, error) {
 	formatsMu.Lock()
 	fs := formats
 	formatsMu.Unlock()
-	for _, f := range fs {
-		if match(f.magic, head[:n]) {
-			d, err := f.open(r)
-			if err != nil {
-				return nil, f.name, err
+	for _, b := range [][]byte{after[:m], head[:n]} {
+		for _, f := range fs {
+			if len(b) > 0 && match(f.magic, b) {
+				d, err := f.open(r)
+				if err != nil {
+					return nil, f.name, err
+				}
+				return d, f.name, nil
 			}
-			return d, f.name, nil
 		}
 	}
 	return nil, "", ErrFormat
@@ -282,7 +296,7 @@ func (p *Player) Play() {
 		// A sound starting at its start starts at once; one resuming in
 		// the middle fades in, as one pausing fades out, without a click.
 		// One still fading out ramps back from where it is.
-		v.snap = v.idx+3 <= 0
+		v.snap = v.head <= 0
 		v.fadeIn = !v.snap
 		v.active = true
 		voices = append(voices, v)
@@ -318,6 +332,29 @@ func (p *Player) Playing() bool {
 	return p.v.playing
 }
 
+// endListener is a function OnEnd registered.
+type endListener struct {
+	id uint64
+	fn func()
+}
+
+// OnEnd calls fn on a goroutine of its own each time the player plays to
+// its end, which a looping player never does, as a playlist plays the
+// next track then. off removes it.
+func (p *Player) OnEnd(fn func()) (off func()) {
+	mu.Lock()
+	defer mu.Unlock()
+	v := p.v
+	v.nextEnd++
+	id := v.nextEnd
+	v.onEnd = append(v.onEnd, endListener{id, fn})
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		v.onEnd = slices.DeleteFunc(slices.Clone(v.onEnd), func(l endListener) bool { return l.id == id })
+	}
+}
+
 // Seek moves the player to t from the start.
 func (p *Player) Seek(t time.Duration) {
 	mu.Lock()
@@ -334,11 +371,13 @@ func (p *Player) Seek(t time.Duration) {
 	v.reset(f)
 }
 
-// Position returns how far the player is from the start.
+// Position returns how far the player is from the start, in what is heard:
+// the output mixes ahead of it (SetLatency), and the player goes on for
+// as long after a pause, but it is where Seek moved it at once.
 func (p *Player) Position() time.Duration {
 	mu.Lock()
 	defer mu.Unlock()
-	return time.Duration(p.v.position() / p.v.rate * float64(time.Second))
+	return time.Duration(p.v.position(p.v.heardAt()) / p.v.rate * float64(time.Second))
 }
 
 // Duration returns how long the player's audio is, or 0 if unknown.
@@ -386,7 +425,7 @@ func (p *Player) Pan() float64 {
 // SetSpeed sets how fast the player plays, which changes its pitch with
 // it, as a record's speed does: 1 (the default) as decoded, 2 twice as
 // fast and an octave higher. Games vary it a little for effects that
-// play often.
+// play often. SetPreservesPitch keeps the pitch instead.
 func (p *Player) SetSpeed(s float64) *Player {
 	mu.Lock()
 	defer mu.Unlock()
@@ -401,6 +440,35 @@ func (p *Player) Speed() float64 {
 	mu.Lock()
 	defer mu.Unlock()
 	return p.v.speed
+}
+
+// SetPreservesPitch sets whether the player keeps its pitch at a speed
+// other than 1, as HTML media's preservesPitch does: true time-stretches
+// it, as a podcast or a lecture plays at 1.5× in the voice it was
+// recorded in, while false, the default, changes the pitch with the
+// speed (SetSpeed). Time-stretching suits speech and other sound with a
+// pitch at speeds from about 0.5 to 4, and costs a little more to mix;
+// sharp attacks, as drums', come out a little smeared. A change applies
+// after what the player stretched ahead, about 16 ms, without a gap.
+func (p *Player) SetPreservesPitch(on bool) *Player {
+	mu.Lock()
+	defer mu.Unlock()
+	v := p.v
+	if v.closed {
+		return p
+	}
+	v.pitch = on
+	if on && v.st == nil {
+		v.stretch()
+	}
+	return p
+}
+
+// PreservesPitch reports whether the player keeps its pitch at its speed.
+func (p *Player) PreservesPitch() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return p.v.pitch
 }
 
 // SetLoop sets whether the player starts again from the start when it
@@ -458,9 +526,10 @@ func (p *Player) Close() {
 }
 
 var (
-	volume = 1.0
-	outErr error
-	errMu  sync.Mutex
+	volume  = 1.0
+	latency = LatencyInteractive
+	outErr  error
+	errMu   sync.Mutex
 )
 
 // SetVolume sets the volume of everything played, a gain: 1 (the default)
@@ -476,6 +545,49 @@ func Volume() float64 {
 	mu.Lock()
 	defer mu.Unlock()
 	return volume
+}
+
+// Latency is how far ahead of what is heard the output mixes, as Web
+// Audio's latencyHint.
+type Latency int
+
+const (
+	// LatencyInteractive mixes about 40 ms ahead, so that sounds start,
+	// stop and change as soon as they are asked to, as games and
+	// interfaces want. It is the default.
+	LatencyInteractive Latency = iota
+	// LatencyPlayback mixes about 250 ms ahead, for apps that play music
+	// and other long audio: it plays on through the moments the system
+	// keeps an app waiting, as macOS does while its appearance changes,
+	// where the interactive latency runs dry and is heard to stop. Plays,
+	// pauses, seeks and volume changes are heard that much later.
+	LatencyPlayback
+)
+
+// ahead returns how much the output holds before it is heard.
+func (l Latency) ahead() time.Duration {
+	if l == LatencyPlayback {
+		return 250 * time.Millisecond
+	}
+	return 40 * time.Millisecond
+}
+
+// SetLatency sets how far ahead the output mixes. An output already open
+// opens again, which drops what it held.
+func SetLatency(l Latency) {
+	mu.Lock()
+	defer mu.Unlock()
+	if l != LatencyPlayback {
+		l = LatencyInteractive
+	}
+	latency = l
+}
+
+// outputLatency returns the latency set.
+func outputLatency() Latency {
+	mu.Lock()
+	defer mu.Unlock()
+	return latency
 }
 
 // Err returns why the last output to open is not the system's audio

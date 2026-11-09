@@ -71,6 +71,8 @@ const (
 	glClampToEdge        = 0x812F
 	glR8                 = 0x8229
 	glRed                = 0x1903
+	glRG8                = 0x822B
+	glRG                 = 0x8227
 	glRGBA8              = 0x8058
 	glRGBA               = 0x1908
 	glUnpackAlignment    = 0x0CF5
@@ -95,7 +97,10 @@ const (
 )
 
 type texture struct {
-	tex       uint32
+	tex uint32
+	// chroma is the texture of the chroma of a frame of video in NV12,
+	// whose luma tex is (scene.SurfaceNV12), or 0.
+	chroma    uint32
 	w, h      int
 	gen, ver  uint64
 	lastFrame uint64
@@ -164,7 +169,37 @@ type Renderer struct {
 	blurTmp  [2]target
 
 	b gpu.Builder
+
+	// Partial has frames draw only what changed since the last one, into
+	// a framebuffer that keeps what was drawn (a GtkGLArea's, between
+	// reallocations, which Invalidate tells): diff finds what changed, and
+	// pipelines what the ops draw with; held tells that the framebuffer
+	// holds the last frame drawn. redrew is how much of it was drawn, for
+	// FrameInfo.
+	Partial   bool
+	diff      scene.Differ
+	pipelines gpu.Pipelines
+	held      bool
+	redrew    redrawn
+	part      gpu.Part
 }
+
+// redrawn is how much of a frame was drawn.
+type redrawn int8
+
+const (
+	redrewWhole redrawn = iota
+	redrewPart
+	redrewNothing
+)
+
+// noPartial draws every frame whole, for measurements that compare.
+var noPartial = os.Getenv("MYGO_PARTIAL") == "0"
+
+// Invalidate tells that the framebuffer no longer holds the last frame
+// drawn, as a GtkGLArea makes its buffers anew as it is allocated, at the
+// same size too: the next frame draws whole.
+func (r *Renderer) Invalidate() { r.held = false }
 
 // effectProgram is the program of an effect and the location of its
 // uSize, or why it has none.
@@ -190,6 +225,9 @@ func New() (*Renderer, error) {
 		return nil, err
 	}
 	r := &Renderer{images: map[uint64]*texture{}, context: currentContext()}
+	// Quads reach a pixel out of their shapes, glyphs half a pixel more, as
+	// they draw at whole pixels.
+	r.diff.Reach = 2
 	if err := r.init(); err != nil {
 		r.Release()
 		return nil, err
@@ -199,6 +237,11 @@ func New() (*Renderer, error) {
 
 // init creates the program, buffers and textures in the current context.
 func (r *Renderer) init() error {
+	if !hasContext() {
+		// OpenGL tells no version without a context, and libepoxy may
+		// abort asking for one.
+		return errNoContext
+	}
 	version, es := contextVersion()
 	r.es = es
 	if r.es && version < 30 || !r.es && version < 33 {
@@ -243,6 +286,7 @@ func (r *Renderer) init() error {
 	glUniform1i(glGetUniformLocation(r.program, "uImage"), 2)
 	glUniform1i(glGetUniformLocation(r.program, "uClipMask"), 4)
 	glUniform1i(glGetUniformLocation(r.program, "uStops"), stopsUnit)
+	glUniform1i(glGetUniformLocation(r.program, "uChroma"), chromaUnit)
 	glUseProgram(0)
 	if r.down, err = passLink(header, "DOWN"); err != nil {
 		return err
@@ -445,8 +489,11 @@ func newTexture(internal int32, format uint32, w, h int, pix []byte, stride int)
 // unpack sets the layout of the pixels uploads read: rows of stride bytes.
 func unpack(stride int, internal int32) {
 	bpp := 4
-	if internal == glR8 {
+	switch internal {
+	case glR8:
 		bpp = 1
+	case glRG8:
+		bpp = 2
 	}
 	glPixelStorei(glUnpackAlignment, 1)
 	glPixelStorei(glUnpackRowLength, int32(stride/bpp))
@@ -500,23 +547,115 @@ func (r *Renderer) imageTexture(img *scene.Image) uintptr {
 		}
 		return 0
 	}
+	if s := img.Surface; s != nil && s.Format == scene.SurfaceNV12 && s.Planes[1].Pix != nil {
+		return r.planesTexture(img, s)
+	} else if s != nil && s.Native != 0 {
+		return r.elementTexture(img, s)
+	}
 	t := r.images[img.ID()]
-	if t == nil {
-		t = &texture{tex: newTexture(glRGBA8, glRGBA, img.W, img.H, img.Pix, img.W*4), w: img.W, h: img.H, ver: img.Version()}
-		r.images[img.ID()] = t
-	} else if t.w != img.W || t.h != img.H {
+	if t != nil && t.chroma != 0 {
+		// It showed a frame of video in planes, and no longer does.
 		glDeleteTextures(1, &t.tex)
-		t.tex = newTexture(glRGBA8, glRGBA, img.W, img.H, img.Pix, img.W*4)
-		t.w, t.h, t.ver = img.W, img.H, img.Version()
+		glDeleteTextures(1, &t.chroma)
+		delete(r.images, img.ID())
+		t = nil
+	}
+	if t == nil {
+		pix := img.Pixels()
+		if pix == nil {
+			return 0
+		}
+		t = &texture{tex: newTexture(glRGBA8, glRGBA, img.W, img.H, pix, img.W*4), w: img.W, h: img.H, ver: img.Version()}
+		r.images[img.ID()] = t
+		img.Uploaded()
+	} else if t.w != img.W || t.h != img.H {
+		if pix := img.Pixels(); pix != nil {
+			glDeleteTextures(1, &t.tex)
+			t.tex = newTexture(glRGBA8, glRGBA, img.W, img.H, pix, img.W*4)
+			t.w, t.h, t.ver = img.W, img.H, img.Version()
+			img.Uploaded()
+		}
+	} else if t.ver != img.Version() {
+		if pix := img.Pixels(); pix != nil {
+			glBindTexture(glTexture2D, t.tex)
+			unpack(img.W*4, glRGBA8)
+			glTexSubImage2D(glTexture2D, 0, 0, 0, int32(img.W), int32(img.H), glRGBA, glUnsignedByte, unsafe.Pointer(&pix[0]))
+			unpackReset()
+			t.ver = img.Version()
+			img.Uploaded()
+		}
+	}
+	t.lastFrame = r.frame
+	return uintptr(t.tex)
+}
+
+// planesTexture uploads the planes of a frame of video in NV12, the luma
+// into the texture it returns and the chroma into the one chromaTexture
+// returns, which the shader converts as it samples them: half the bytes
+// RGBA takes, and no conversion on the CPU.
+func (r *Renderer) planesTexture(img *scene.Image, s *scene.Surface) uintptr {
+	cw, ch := (img.W+1)/2, (img.H+1)/2
+	t := r.images[img.ID()]
+	if t != nil && (t.chroma == 0 || t.w != img.W || t.h != img.H) {
+		glDeleteTextures(1, &t.tex)
+		if t.chroma != 0 {
+			glDeleteTextures(1, &t.chroma)
+		}
+		t = nil
+	}
+	if t == nil {
+		t = &texture{w: img.W, h: img.H, ver: img.Version()}
+		t.tex = newTexture(glR8, glRed, img.W, img.H, s.Planes[0].Pix, s.Planes[0].Stride)
+		t.chroma = newTexture(glRG8, glRG, cw, ch, s.Planes[1].Pix, s.Planes[1].Stride)
+		r.images[img.ID()] = t
 	} else if t.ver != img.Version() {
 		glBindTexture(glTexture2D, t.tex)
-		unpack(img.W*4, glRGBA8)
-		glTexSubImage2D(glTexture2D, 0, 0, 0, int32(img.W), int32(img.H), glRGBA, glUnsignedByte, unsafe.Pointer(&img.Pix[0]))
+		unpack(s.Planes[0].Stride, glR8)
+		glTexSubImage2D(glTexture2D, 0, 0, 0, int32(img.W), int32(img.H), glRed, glUnsignedByte, unsafe.Pointer(&s.Planes[0].Pix[0]))
+		glBindTexture(glTexture2D, t.chroma)
+		unpack(s.Planes[1].Stride, glRG8)
+		glTexSubImage2D(glTexture2D, 0, 0, 0, int32(cw), int32(ch), glRG, glUnsignedByte, unsafe.Pointer(&s.Planes[1].Pix[0]))
 		unpackReset()
 		t.ver = img.Version()
 	}
 	t.lastFrame = r.frame
 	return uintptr(t.tex)
+}
+
+// elementTexture uploads the frame of video of a browser's video element
+// (the surface's Native) into the texture it returns, GPU to GPU.
+func (r *Renderer) elementTexture(img *scene.Image, s *scene.Surface) uintptr {
+	t := r.images[img.ID()]
+	if t != nil && (t.chroma != 0 || t.w != img.W || t.h != img.H) {
+		glDeleteTextures(1, &t.tex)
+		if t.chroma != 0 {
+			glDeleteTextures(1, &t.chroma)
+		}
+		delete(r.images, img.ID())
+		t = nil
+	}
+	if t == nil {
+		t = &texture{tex: newTexture(glRGBA8, glRGBA, img.W, img.H, nil, 0), w: img.W, h: img.H}
+		r.images[img.ID()] = t
+	}
+	if t.ver != img.Version() {
+		glBindTexture(glTexture2D, t.tex)
+		if !uploadElement(s.Native) {
+			return 0
+		}
+		t.ver = img.Version()
+	}
+	t.lastFrame = r.frame
+	return uintptr(t.tex)
+}
+
+// chromaTexture returns the texture of the chroma of a frame of video in
+// NV12, after imageTexture returned that of its luma, or 0.
+func (r *Renderer) chromaTexture(img *scene.Image) uintptr {
+	if t := r.images[img.ID()]; t != nil {
+		return uintptr(t.chroma)
+	}
+	return 0
 }
 
 // Render draws s into the bound framebuffer, which is s.Width×s.Height
@@ -556,13 +695,63 @@ func (r *Renderer) draw(s *scene.Scene) error {
 	if err := r.drawCanvases(s); err != nil {
 		return err
 	}
-	if err := r.drawScene(s, &r.b); err != nil {
+	if err := r.drawFrame(s); err != nil {
 		return err
 	}
 	if r.frame%120 == 0 {
 		r.sweep()
 	}
 	return nil
+}
+
+// drawFrame draws the frame s into the framebuffer bound, only where it
+// changed since the last frame drawn when it holds that one (Partial).
+func (r *Renderer) drawFrame(s *scene.Scene) error {
+	if !r.Partial || noPartial {
+		r.redrew = redrewWhole
+		return r.drawScene(s, &r.b)
+	}
+	damage, known := r.diff.Diff(s)
+	known = known && r.held
+	if known && len(damage) == 0 {
+		// The framebuffer holds the frame already.
+		r.redrew = redrewNothing
+		return nil
+	}
+	built, err := r.buildScene(s, &r.b)
+	if err != nil {
+		r.held = false
+		return err
+	}
+	damage = r.pipelines.Damage(&r.b, r.batchKey, &r.diff, damage, known)
+	var part *gpu.Part
+	r.redrew = redrewWhole
+	if known && r.part.Set(damage, s.Width, s.Height, func(d []image.Rectangle) []image.Rectangle { return r.diff.AddBackdrops(s, d) }) {
+		part, r.redrew = &r.part, redrewPart
+	}
+	r.held = false
+	if err := r.drawBuilt(built, &r.b, part); err != nil {
+		return err
+	}
+	r.held = true
+	r.diff.Remember(s)
+	r.pipelines.Remember()
+	return nil
+}
+
+// batchKey returns what batch i of the frame built draws with: its
+// program and blending (gpu.Pipelines).
+func (r *Renderer) batchKey(i int) uint64 {
+	bt := &r.b.Batches[i]
+	program := r.program
+	if bt.Effect != nil {
+		program = r.effectProgram(bt.Effect).program
+	}
+	key := uint64(program) << 1
+	if bt.Hole {
+		key |= 1
+	}
+	return key
 }
 
 // drawCanvases draws the canvases s draws anew or shows into their
@@ -635,9 +824,19 @@ func (r *Renderer) deleteCanvas(t *canvasTexture) {
 
 // drawScene draws s into the framebuffer bound, with b.
 func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
-	b.BlurredImage = r.blurImage
+	built, err := r.buildScene(s, b)
+	if err != nil {
+		return err
+	}
+	return r.drawBuilt(built, b, nil)
+}
+
+// buildScene builds the instances of s with b, with the textures they
+// read, and returns the scene built.
+func (r *Renderer) buildScene(s *scene.Scene, b *gpu.Builder) (*scene.Scene, error) {
+	b.BlurredImage, b.Chroma = r.blurImage, r.chromaTexture
 	s = b.Build(s, r.imageTexture)
-	b.BlurredImage = nil
+	b.BlurredImage, b.Chroma = nil, nil
 	r.syncStops(b)
 	// Canvases' rows go up, as GL's: images showing them sample them
 	// flipped, which their source rectangles may be (scene.OpImage).
@@ -654,8 +853,15 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 		}
 	}
 	if err := r.fitBackdrop(b); err != nil {
-		return err
+		return nil, err
 	}
+	return s, nil
+}
+
+// drawBuilt draws s, built with b (buildScene), into the framebuffer
+// bound, whole or, unless part is nil, only within its rectangles, keeping
+// what the framebuffer holds elsewhere.
+func (r *Renderer) drawBuilt(s *scene.Scene, b *gpu.Builder, part *gpu.Part) error {
 	// The framebuffer drawn into, GTK's, which the passes computing
 	// backdrops leave for their own.
 	var fb int32
@@ -665,7 +871,22 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 	glDisable(glScissorTest)
 	c := s.Clear.Premul(1)
 	glClearColor(c[0], c[1], c[2], c[3])
-	glClear(glColorBufferBit)
+	areas := []gpu.Scissor{{Right: int32(s.Width), Bottom: int32(s.Height)}}
+	if part != nil {
+		if len(part.Rects) == 0 {
+			return nil
+		}
+		areas = part.Rects
+		glEnable(glScissorTest)
+		for _, a := range areas {
+			// GL's scissor rectangles start at the bottom.
+			glScissor(a.Left, int32(s.Height)-a.Bottom, a.Right-a.Left, a.Bottom-a.Top)
+			glClear(glColorBufferBit)
+		}
+	} else {
+		glClear(glColorBufferBit)
+	}
+	glDisable(glScissorTest)
 	if len(b.Instances) == 0 {
 		return nil
 	}
@@ -677,7 +898,7 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 		sc := bt.Scissor
 		sc.Left, sc.Top = max(sc.Left, 0), max(sc.Top, 0)
 		sc.Right, sc.Bottom = min(sc.Right, int32(s.Width)), min(sc.Bottom, int32(s.Height))
-		if bt.Count == 0 || sc.Empty() {
+		if bt.Count == 0 || !meets(sc, areas) {
 			continue
 		}
 		want := r.program
@@ -713,6 +934,11 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 		if bt.Image != 0 && bt.Image != bound {
 			bound = bt.Image
 			glBindTexture(glTexture2D, uint32(bound)) // unit 2 is active
+			if bt.Chroma != 0 {
+				glActiveTexture(glTexture0 + chromaUnit)
+				glBindTexture(glTexture2D, uint32(bt.Chroma))
+				glActiveTexture(glTexture0 + 2)
+			}
 		}
 		glActiveTexture(glTexture0 + 4)
 		glBindTexture(glTexture2D, or(uint32(bt.ClipMask), r.empty))
@@ -726,15 +952,21 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 		for i := range uint32(attributes) {
 			glVertexAttribPointer(i, 4, glFloat, false, int32(gpu.InstanceSize), offset+uintptr(i)*16)
 		}
-		// GL's scissor rectangles start at the bottom.
-		glScissor(sc.Left, int32(s.Height)-sc.Bottom, sc.Right-sc.Left, sc.Bottom-sc.Top)
-		glDrawArraysInstanced(glTriangleStrip, 0, 4, int32(bt.Count))
+		// Drawn once in each rectangle of the part it meets, which are
+		// apart from each other.
+		for _, a := range areas {
+			if in := sc.Intersect(a); !in.Empty() {
+				// GL's scissor rectangles start at the bottom.
+				glScissor(in.Left, int32(s.Height)-in.Bottom, in.Right-in.Left, in.Bottom-in.Top)
+				glDrawArraysInstanced(glTriangleStrip, 0, 4, int32(bt.Count))
+			}
+		}
 	}
 	// Leave the state as GTK, which draws the area with the same context,
 	// expects it.
 	glDisable(glScissorTest)
 	glDisable(glBlend)
-	for unit := range stopsUnit + 1 {
+	for unit := range chromaUnit + 1 {
 		glActiveTexture(glTexture0 + uint32(unit))
 		glBindTexture(glTexture2D, 0)
 	}
@@ -748,6 +980,10 @@ func (r *Renderer) drawScene(s *scene.Scene, b *gpu.Builder) error {
 
 // stopsUnit is the texture unit of the stops of gradients (uStops).
 const stopsUnit = 9
+
+// chromaUnit is the texture unit of the chroma of frames of video in NV12
+// (gpu.Batch.Chroma).
+const chromaUnit = 10
 
 // syncStops uploads the stops of the gradients b built into r.stops,
 // which r.stopsTex then is, or 0 for none.
@@ -1032,6 +1268,7 @@ func (r *Renderer) forget() {
 	clear(r.canvases)
 	clear(r.canvasTex)
 	r.stops, r.stopsTex, r.blurred, r.used, r.blurTmp = texture{}, 0, nil, 0, [2]target{}
+	r.held = false
 }
 
 // Software reports whether the context draws on the CPU, as Mesa's
@@ -1062,6 +1299,9 @@ func (r *Renderer) Release() {
 	}
 	for _, t := range r.images {
 		glDeleteTextures(1, &t.tex)
+		if t.chroma != 0 {
+			glDeleteTextures(1, &t.chroma)
+		}
 	}
 	for _, t := range r.canvases {
 		r.deleteCanvas(t)
@@ -1112,7 +1352,15 @@ func (r *Renderer) Release() {
 }
 
 // FrameInfo describes the last frame for MYGO_FRAME_STATS.
-func (r *Renderer) FrameInfo() string { return r.b.Summary() }
+func (r *Renderer) FrameInfo() string {
+	switch r.redrew {
+	case redrewPart:
+		return fmt.Sprintf("redrew %s, %s", r.part.String(), r.b.Summary())
+	case redrewNothing:
+		return "unchanged"
+	}
+	return r.b.Summary()
+}
 
 // sweep frees the textures of images no frame drew for a while, and
 // those of canvases gone, or transient and not drawn this frame: render
@@ -1121,6 +1369,9 @@ func (r *Renderer) sweep() {
 	for key, t := range r.images {
 		if r.frame-t.lastFrame > 240 {
 			glDeleteTextures(1, &t.tex)
+			if t.chroma != 0 {
+				glDeleteTextures(1, &t.chroma)
+			}
 			delete(r.images, key)
 		}
 	}
@@ -1130,4 +1381,14 @@ func (r *Renderer) sweep() {
 			delete(r.canvases, key)
 		}
 	}
+}
+
+// meets reports whether sc meets one of areas.
+func meets(sc gpu.Scissor, areas []gpu.Scissor) bool {
+	for _, a := range areas {
+		if !sc.Intersect(a).Empty() {
+			return true
+		}
+	}
+	return false
 }

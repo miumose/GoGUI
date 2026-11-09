@@ -29,23 +29,45 @@ path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
 
 // Ask a question.
 res, err := mygo.Dialog.Message(mygo.MessageOptions{
-	Parent:        win,
-	Type:          mygo.MessageWarning,
-	Message:       "Delete 3 notes?",
-	Detail:        "You cannot undo this.",
-	Buttons:       []string{"Delete", "Cancel"},
-	CheckboxLabel: "Don't ask again",
+	Parent:             win,
+	Type:               mygo.MessageWarning,
+	Message:            "Delete 3 notes?",
+	Detail:             "You cannot undo this.",
+	Buttons:            []string{"Cancel", "Delete"},
+	DestructiveButtons: []int{1},
+	CheckboxLabel:      "Don't ask again",
 })
-if res.Button == 0 { /* Delete */ }
+if res.Button == 1 { /* Delete */ }
 
 // Report an error.
 mygo.Dialog.Error("Import failed", err.Error())
 ```
 
 `OpenDialogOptions` also pick directories (`Directory`), show hidden files
-and, on macOS, a message and a New Folder button. In message dialogs Enter
-activates `DefaultButton` and Escape `CancelButton`, by default the first
-button labeled Cancel or No.
+and, on macOS, a message and a New Folder button.
+
+A filter takes files by type too, as HTML's `accept`: `MIMETypes` such as
+`"application/pdf"`, or all of a kind, `"image/*"`, which the system's
+picker matches as it knows them, rather than a list of every extension:
+
+```go
+mygo.FileFilter{Name: "Pictures", MIMETypes: []string{"image/*"}}
+```
+
+macOS 11 and later take them as types of files (`UTType`), the kinds
+`image/*`, `audio/*`, `video/*`, `text/*` and `font/*` as theirs
+(`public.image` and the others), which is all earlier versions take; GTK
+matches them, wildcards too; Windows filters by the extensions its
+registry gives the type, or every type of the kind and every file its
+`PerceivedType` says is of it.
+
+In message dialogs Enter activates `DefaultButton` and Escape
+`CancelButton`, also when they are one button, as Cancel above. On macOS
+Cmd+. cancels too, and a `DefaultButton` of -1 leaves Enter to no button.
+`CancelButton` defaults to the first button labeled Cancel or No, else to
+the first button. For Delete / Keep, set `CancelButton: 1` to choose Keep;
+otherwise Escape chooses Delete. `DestructiveButtons` sets apart buttons
+that delete or can't be undone.
 
 ## Notifications
 
@@ -67,7 +89,9 @@ desktop's notification service, Windows as notification-area balloons.
 `Show` returns once the system has the notification. On macOS the first
 one asks the user whether to allow notifications, and `Show` waits for the
 answer; it returns `mygo.ErrNotificationsDenied` when they are not allowed,
-by that answer or later in System Settings.
+by that answer or later in System Settings. `ShowContext(ctx)` stops
+waiting when `ctx` is done, as an app quits with the question still open,
+and takes away a notification that the answer lets through after that.
 
 macOS keeps a notification in Notification Center after it is clicked,
 until the app removes it: `Close` it in `OnClick` to take it away, or call
@@ -110,6 +134,26 @@ mygo.NewNotification(mygo.NotificationOptions{
 }).Show()
 ```
 
+`Image` shows an image with the notification, the bytes of a PNG or JPEG,
+such as the cover of the track that started playing. macOS attaches it,
+as a thumbnail that grows as the notification expands; Linux gives the
+desktop's notification service its pixels, scaled down to fit 256 pixels;
+Windows shows it as the balloon's large icon, in place of the app's. An
+image the system cannot decode leaves the notification without one.
+`NewNotification` copies it, so the app can reuse its buffer; MyGo does
+not fetch remote images:
+
+```go
+// One notification for what plays, replaced as the track changes.
+mygo.NewNotification(mygo.NotificationOptions{
+	ID:     "now-playing",
+	Title:  track.Title,
+	Body:   track.Artist + " — " + track.Album,
+	Image:  track.Cover,
+	Silent: true,
+}).Show()
+```
+
 ### Sender avatars on macOS
 
 An incoming direct message can supply a sender to display a prominent
@@ -127,7 +171,8 @@ mygo.NewNotification(mygo.NotificationOptions{
 
 `Sender.ID` identifies the person in the app; it is not inferred to be an
 email address or phone number. `Name` defaults to `Title`. `Avatar` holds
-encoded image bytes, such as PNG or JPEG; the app fetches them and decides
+encoded image bytes, such as PNG, JPEG or SVG; macOS rasterizes them as PNG
+before donation. The app fetches them and decides
 whether the message's sender and content may be shared with the system.
 `NewNotification` copies the sender and image, so the app can reuse its
 buffers. `Group` is the conversation identifier; without one, it uses the
@@ -185,8 +230,21 @@ mygo.Shell.OpenExternal("https://example.com") // the default browser
 mygo.Shell.OpenPath("/Users/ada/report.pdf")   // the default app for the file
 mygo.Shell.ShowItemInFolder(path)              // Finder, Explorer, the file manager
 mygo.Shell.TrashItem(path)                     // to the trash
+mygo.Shell.PreviewItem(path)                   // Quick Look, as the space bar does
 mygo.Shell.Beep()
 ```
+
+`TrashItem` never deletes for good: when the item cannot go to the trash
+it fails and leaves the item where it is. On Windows that is an item too
+big for the recycle bin, or on a drive without one, as network shares and
+many removable drives are, which Windows would otherwise delete without
+asking.
+
+`PreviewItem` shows a file in the Quick Look panel, the preview Finder
+opens with the space bar: the panel stays open until the user closes it,
+and asking again replaces the item it shows. It is macOS only; other
+platforms return `ErrUnsupported`. The panel is not modal: the app keeps
+running and the call returns once the item is set.
 
 `FileIcon` returns the icon the file manager shows for a file, a folder
 or an application, as a PNG of the size asked for in pixels: pass the size
@@ -205,6 +263,15 @@ also name a shell item, such as an app of the Start menu by
 content type from the icon theme, and for a desktop entry (`.desktop`), the
 icon of its application, or where the theme has none, that of desktop
 entries.
+
+`TypeIcon` returns the icon of a file type, by its extension, with or
+without the dot, without a file of that type on disk: the icon of an
+attachment not yet downloaded, say. It is drawn as `FileIcon` draws its
+icon, and fails in browsers.
+
+```go
+png, err := mygo.Shell.TypeIcon("pdf", 64)
+```
 
 `InstalledApps` lists the applications installed on the computer, sorted
 by name, as a launcher shows them, and `LaunchApp` starts one, or brings
@@ -256,6 +323,14 @@ mygo.Screen.OnDisplaysChanged(func() { /* rearrange windows */ })
 ```
 
 `WorkArea` leaves out the menu bar, the Dock and taskbars.
+
+On Windows, displays can have different scales. Each display's
+coordinates start at its top-left corner in pixels divided by the
+smallest scale of the displays, and go on in its own scale, so that
+displays never overlap: one with a larger scale than another's leaves a
+gap after it. Where every display has the same scale, coordinates are
+the pixels divided by that scale. A window's bounds are in the scale of
+the display it is the most on.
 `DisplayMatching(rect)` returns the display a rectangle overlaps most, the
 one a window is on.
 
@@ -323,6 +398,10 @@ is that same JSON, and the generated client types it with mygo-runtime's
 release := mygo.Power.KeepAwake("Exporting the video", false)
 defer release()
 
+// Keep the app at full speed while none of its windows shows.
+stop := mygo.Power.KeepRunning("Serving the phones")
+defer stop()
+
 mygo.Power.OnSuspend(func() { pauseSync() })
 mygo.Power.OnResume(func() { resumeSync() })
 mygo.Power.OnLockScreen(func() { hideSecrets() })
@@ -333,9 +412,69 @@ idle := mygo.Power.IdleTime() // since the last keyboard or mouse input
 ```
 
 The reason given to `KeepAwake` shows where the system lists what keeps it
-awake. On Linux, `OnLockScreen` is called when the screen saver starts,
+awake.
+
+macOS puts an app none of whose windows shows, hidden, minimized, covered
+or behind the locked screen, into App Nap within a minute: it lowers the
+app's priority, coalesces its timers and throttles its I/O, which slows an
+app that serves the network, streams or syncs in the background. A tray
+icon counts as a window that shows while the menu bar shows it.
+`KeepRunning` keeps App Nap off until its release, and lets the computer
+sleep when idle, as an app that stays in the menu bar all day should;
+`KeepAwake` keeps App Nap off too, but the computer awake as well. Other
+systems do nothing for `KeepRunning`.
+
+On Linux, `OnLockScreen` is called when the screen saver starts,
 which usually locks the screen, and `IdleTime` is 0 on desktops that do not
 report it.
+
+## Now Playing and media keys
+
+`mygo.NowPlaying` shows what the app plays where the system shows media:
+Now Playing in Control Center and the menu bar on macOS, the media
+controls of the volume flyout and the lock screen on Windows, and on Linux
+the MPRIS clients, as GNOME's and KDE's media controls and `playerctl`.
+While it shows something, the media keys of keyboards and headsets, and
+those controls, send the app commands:
+
+```go
+mygo.NowPlaying.Set(mygo.NowPlayingInfo{
+	Title: "Spring", Artist: "Vivaldi", Album: "The Four Seasons",
+	Artwork:  cover, // PNG or JPEG
+	Duration: 3*time.Minute + 20*time.Second,
+	Commands: mygo.MediaPlay | mygo.MediaPause | mygo.MediaNext | mygo.MediaPrevious | mygo.MediaSeek,
+})
+mygo.NowPlaying.OnCommand(func(cmd mygo.MediaCommand, pos time.Duration) {
+	switch cmd {
+	case mygo.MediaPause:
+		player.Pause()
+		mygo.NowPlaying.SetPlayback(mygo.PlaybackPaused, pos) // where playback is
+	case mygo.MediaSeek:
+		player.Seek(pos)
+		mygo.NowPlaying.SetPlayback(mygo.PlaybackPlaying, pos)
+	case mygo.MediaNext:
+		playNext() // and Set the next track's info
+	}
+})
+mygo.NowPlaying.Clear() // the app no longer shows in the controls
+```
+
+The system advances the position while the state is `PlaybackPlaying`, so
+the app sets it again only when playback jumps. The play/pause key sends
+`MediaPause` while the state is playing and `MediaPlay` otherwise, and
+only the commands the info offers reach `OnCommand` (`Commands` 0 offers
+play, pause and stop). `pos` is where `MediaSeek` moves to, and for the
+other commands where playback is as they come. An app playing a player of package `audio` can let
+`Control` play, pause, stop and seek it, and show its state:
+
+```go
+release := mygo.NowPlaying.Control(music) // an *audio.Player
+defer release()
+```
+
+`Control` hears the player's end; after the app plays, pauses or seeks it
+itself, `NowPlaying.Sync` shows it. In browsers, `NowPlaying` is the
+page's Media Session.
 
 ## Network
 
@@ -385,6 +524,50 @@ func init() {
 }
 ```
 
+### Proxies
+
+Web pages reach the network through the webview, which follows the
+proxy the user set in the system's settings, with its bypass list and
+setup script (PAC file): WebView2 as Chromium does, from Windows' proxy
+settings; WKWebView from macOS's; WebKitGTK through GIO's default proxy
+resolver, which reads GNOME's settings, or KDE's through libproxy.
+
+Go's `http.DefaultClient` reads only `HTTP_PROXY`, `HTTPS_PROXY` and
+`NO_PROXY`. Package `netproxy` makes Go's requests follow the system's
+settings as the pages do, and MyGo's own requests use it: those of the
+[updater](updates.md) and, unless their options name a client, of the
+[fetch](plugins/fetch.md) and [websocket](plugins/websocket.md) plugins.
+Your own clients opt in with its transport:
+
+```go
+import "github.com/egoist/mygo/netproxy"
+
+client := &http.Client{Transport: netproxy.Transport(), Timeout: time.Minute}
+```
+
+or, for a transport of your own, `t.Proxy = netproxy.Proxy`. For each
+request:
+
+1. Loopback hosts (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) are
+   reached directly.
+2. When `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` (or its
+   lowercase name) is set, the environment decides, as
+   `http.ProxyFromEnvironment` does, so that a proxy set for one run of
+   the app wins.
+3. Otherwise the system's settings for the URL decide: on Windows the
+   user's, read by WinHTTP, with automatic detection (WPAD) and setup
+   scripts; on macOS those of System Settings > Network > Proxies, read
+   by CFNetwork, with setup scripts; on Linux GIO's default proxy
+   resolver, as WebKitGTK. Without an answer, requests go direct.
+
+The system's answer for a scheme and host is kept for 5 seconds, so
+turning the proxy on or off, or changing it, applies to the requests that
+follow while the app runs. Requests under way, such as a download or a
+stream, keep their connection. Go's transport speaks to HTTP and HTTPS
+proxies and SOCKS5, not SOCKS4; it sends a proxy's password only when the
+system's answer holds it, as GNOME's settings can. In browsers, the
+browser makes Go's requests, through its own proxy.
+
 ## Secrets
 
 `mygo.Secrets` keeps small secrets, such as access tokens and API keys, in
@@ -433,7 +616,10 @@ token, err := mygo.Secrets.Service("MyApp").Get("refresh-token")
 Secrets protect against other users and stolen disks, not against other
 apps of the same user: macOS asks the user before another app reads them,
 and before a rebuilt app does when it is not signed with the same
-identity, while Linux and Windows let them read.
+identity, while Linux and Windows let them read. `mygo dev` signs every
+build with the user's Apple Development identity, so "Always Allow" lasts
+across rebuilds; apps signed ad hoc, as without one, with `-sign -` or with
+`go run`, are asked again after each build.
 
 Where there is no credential store, the methods fail with an error for
 which `errors.Is(err, errors.ErrUnsupported)` holds: in browsers, and on
@@ -491,9 +677,11 @@ negative) before they are reported, and never more than 500 ms
 (`MaxDelay`). A watch compares what it sees with what it saw, so events say
 what is different, not every step that made it so: treat them as hints to
 read the files again. A write is a file whose size or modification time
-changed, or that the system says was written: permissions and other
-metadata, which indexers and antivirus touch, are not reported, nor are
-directories written, whose changes are their entries'.
+changed, or that the system says was written, or a file replaced at its
+path by another, as editors and atomic saves replace it (a temporary file
+renamed over it): permissions and other metadata, which indexers and
+antivirus touch, are not reported, nor are directories written, whose
+changes are their entries'.
 
 A watch doesn't look again until `Next` has taken the last batch: when the
 app is busy, what changed meanwhile comes in the next batch, so nothing is

@@ -3,6 +3,7 @@ package editor
 import (
 	"math"
 	"slices"
+	"sort"
 )
 
 // diffPrepared is what the blocks and hidden lines were made of.
@@ -123,12 +124,22 @@ func (d *DiffState) prepare() {
 	}
 	rowsOf := func(v *view, line int) float32 { return float32(v.heights.wraps.rows(line)) * lh }
 	if unified {
+		// The tops of the deleted lines, which painting them starts at the
+		// first in view with, rather than at the first of a run as long as
+		// a file deleted.
+		d.deletedTops = slices.Grow(d.deletedTops[:0], len(d.model.hunks))[:len(d.model.hunks)]
 		for hi, h := range d.model.hunks {
+			tops := d.deletedTops[hi][:0]
 			if h.A1 > h.A0 {
 				var height float32
+				var top float64
 				for i := h.A0; i < h.A1; i++ {
-					height += rowsOf(viewA, i) + anns[DiffOld][i]
+					tops = append(tops, top)
+					dy := rowsOf(viewA, i) + anns[DiffOld][i]
+					height += dy
+					top += float64(dy)
 				}
+				tops = append(tops, top)
 				b := block{kind: blockDeleted, height: height, from: h.A0, to: h.A1, hunk: hi}
 				if h.B0 < viewB.text.LineCount() {
 					b.line = h.B0
@@ -137,6 +148,7 @@ func (d *DiffState) prepare() {
 				}
 				blkB = append(blkB, b)
 			}
+			d.deletedTops[hi] = tops
 		}
 		// The old text's annotations on unchanged lines go under the same
 		// lines of the new text, as only those show.
@@ -167,23 +179,37 @@ func (d *DiffState) prepare() {
 			*s.blks = append(*s.blks, block{kind: blockSpacer, line: line, below: true, height: extra})
 		}
 	}
+	// Sides as wide as each other wrap an unchanged line alike; sides
+	// the line between them made unlike (SplitPercent) wrap it in as many
+	// rows as their widths take, and the side with fewer leaves the room
+	// of the others under it, as under an annotation. Collapsed lines
+	// take no room on either side.
+	alignRows := d.Wrap && viewA.wrapWidth != viewB.wrapWidth
+	hidden := func(line int) bool {
+		i := sort.Search(len(hideA), func(i int) bool { return hideA[i].to >= line })
+		return i < len(hideA) && hideA[i].from <= line
+	}
 	prevA, prevB := 0, 0
 	unchanged := func(a0, b0, n int) {
 		// Annotations on unchanged lines leave room on the other side.
 		for i := 0; i < n; i++ {
 			ha, hb := sides[0].ann[a0+i], sides[1].ann[b0+i]
-			if ha == 0 && hb == 0 {
+			var ra, rb float32
+			if alignRows && !hidden(a0+i) {
+				ra, rb = rowsOf(viewA, a0+i), rowsOf(viewB, b0+i)
+			}
+			if ha == 0 && hb == 0 && ra == rb {
 				continue
 			}
-			hmax := max(ha, hb)
+			hmax := max(ra+ha, rb+hb)
 			if ha > 0 {
 				*sides[0].blks = append(*sides[0].blks, block{kind: blockAnnotation, line: a0 + i, below: true, height: ha, id: a0 + i})
 			}
 			if hb > 0 {
 				*sides[1].blks = append(*sides[1].blks, block{kind: blockAnnotation, line: b0 + i, below: true, height: hb, id: b0 + i})
 			}
-			emitAnn(sides[0], a0+i, hmax-ha)
-			emitAnn(sides[1], b0+i, hmax-hb)
+			emitAnn(sides[0], a0+i, hmax-ra-ha)
+			emitAnn(sides[1], b0+i, hmax-rb-hb)
 		}
 	}
 	for hi, h := range d.model.hunks {
@@ -290,13 +316,29 @@ func (d *DiffState) setSide(i int, hide []lineSpan, blks []block) {
 	d.blocksV++
 }
 
-// wrapLineNow measures the wraps of a line, if not yet.
+// wrapLineNow measures the wraps of a line, if not yet, as laying it out
+// would, with its faces, but without shaping it (wrapBreaks without fit,
+// which laying it out may find a row more than): a diff measures the lines
+// of all its changes at each width the window is resized through, most of
+// them out of view, and shaping them took most of the time. A line laid
+// out already keeps its rows.
 func (v *view) wrapLineNow(i int) {
 	w := &v.heights.wraps
 	if !w.on || i < 0 || i >= len(w.extra) || w.extra[i] != wrapUnknown {
 		return
 	}
-	v.line(i)
+	if l, ok := v.lines.m[i]; ok {
+		w.set(i, len(l.rows))
+		return
+	}
+	l := &lineLayout{n: i, start: v.text.LineStart(i)}
+	l.text = v.text.Slice(l.start, v.text.LineEnd(i))
+	l.toks, _ = v.tokens(i, l.text, nil)
+	v.display(l)
+	if v.styled {
+		l.faces = v.facesOf(l, nil)
+	}
+	w.set(i, len(v.wrapBreaks(l.disp, l.faces, false))+1)
 }
 
 // gaps returns the runs of unchanged lines and which of them collapse.

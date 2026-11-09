@@ -5,6 +5,7 @@ package mygo
 import (
 	"bytes"
 	"image/png"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -27,6 +28,45 @@ func TestFileIcon(t *testing.T) {
 	}
 	if _, err := Shell.FileIcon(filepath.Join(dir, "missing"), 16); err == nil {
 		t.Error("FileIcon of a missing file did not fail")
+	}
+}
+
+func TestTypeIcon(t *testing.T) {
+	data, err := Shell.TypeIcon(".pdf", 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img, err := png.Decode(bytes.NewReader(data)); err != nil || img.Bounds().Dx() != 24 {
+		t.Errorf("TypeIcon: %v, %v", img, err)
+	}
+	if _, err := Shell.TypeIcon("pdf", 0); err == nil {
+		t.Error("TypeIcon of size 0 did not fail")
+	}
+}
+
+func TestTrashItemRelativePath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	defer func() { fake.Trashed = nil }()
+	if err := Shell.TrashItem(filepath.Join("notes", "old.txt")); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	if want := []string{filepath.Join(wd, "notes", "old.txt")}; !slices.Equal(fake.Trashed, want) {
+		t.Errorf("TrashItem passed %q, want %q", fake.Trashed, want)
+	}
+}
+
+// TestPreviewItemRelativePath checks that a relative path reaches the
+// backend absolute, as the preview needs a file URL.
+func TestPreviewItemRelativePath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	defer func() { fake.Previewed = nil }()
+	if err := Shell.PreviewItem(filepath.Join("notes", "old.txt")); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	if want := []string{filepath.Join(wd, "notes", "old.txt")}; !slices.Equal(fake.Previewed, want) {
+		t.Errorf("PreviewItem passed %q, want %q", fake.Previewed, want)
 	}
 }
 

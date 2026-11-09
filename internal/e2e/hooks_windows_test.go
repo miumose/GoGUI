@@ -18,6 +18,11 @@ func activateMenu(w *mygo.Window, path ...string) (err error) {
 	return err
 }
 
+func menuItemEnabled(w *mygo.Window, path ...string) (enabled bool, err error) {
+	mygo.RunOnMain(func() { enabled, err = win.TestMenuItemEnabled(w.NativeHandle(), path...) })
+	return enabled, err
+}
+
 // Keyboard, dialog and popup automation are not wired on Windows.
 func pressShortcut(string, bool) (bool, bool) { return false, false }
 
@@ -37,6 +42,10 @@ func click(w *mygo.Window, x, y float64) (ok bool) {
 	mygo.RunOnMain(func() { ok = win.TestClickSurface(w.NativeHandle(), x, y) })
 	return ok
 }
+
+// Clicks reach windows showing native UI only: a web view's page is
+// not clicked.
+func clickPage(*mygo.Window, float64, float64) bool { return false }
 
 // appClick clicks with the system's input, which activates windows, and
 // returns once the app handled the click.
@@ -58,17 +67,35 @@ func sideButton(w *mygo.Window, back bool) (ok bool) {
 	return ok
 }
 
+// pinch pinches the touchpad at (x, y) as Windows sends it, scrolling
+// with Ctrl held, which rounds scale.
+func pinch(w *mygo.Window, x, y, scale float64) (got float64, ok bool) {
+	mygo.RunOnMain(func() { got, ok = win.TestPinchSurface(w.NativeHandle(), x, y, scale) })
+	return got, ok
+}
+
 func drag(w *mygo.Window, points [][2]float64) (ok bool) {
 	mygo.RunOnMain(func() { ok = win.TestDragSurface(w.NativeHandle(), points) })
+	return ok
+}
+
+// wheel turns the mouse's wheel a notch down at (x, y), with the message
+// Windows sends.
+func wheel(w *mygo.Window, x, y float64) (ok bool) {
+	mygo.RunOnMain(func() { ok = win.TestWheelSurface(w.NativeHandle(), x, y) })
 	return ok
 }
 
 func webViewAttached(*mygo.Window) (bool, bool) { return false, false }
 
 // Collection behaviors and deactivating the app are macOS's.
-func collectionBehavior(*mygo.Window) (uint, bool) { return 0, false }
-func deactivateApp() bool                          { return false }
-func appActive() (bool, bool)                      { return false, false }
+func collectionBehavior(*mygo.Window) (uint, bool)               { return 0, false }
+func deactivateApp() bool                                        { return false }
+func material(*mygo.Window) (string, int, float64, bool, bool)   { return "", 0, 0, false, false }
+func materialState(*mygo.Window) (int, bool)                     { return 0, false }
+func roundedBacking(*mygo.Window) (bool, float64, float64, bool) { return false, 0, 0, false }
+func windowBacking(*mygo.Window) (bool, float64, bool)           { return false, 0, false }
+func appActive() (bool, bool)                                    { return false, false }
 
 // WebView2 opens DevTools in a window of its own.
 func dockDevTools(*mygo.Window) bool { return false }
@@ -188,6 +215,13 @@ func topNonClient(w *mygo.Window) (px, want int32, supported bool) {
 	return px, want, true
 }
 
+// frameExtension returns how far a window's frame extends over the top and
+// the bottom of its client area, -1 for all over.
+func frameExtension(w *mygo.Window) (top, bottom int32) {
+	mygo.RunOnMain(func() { top, bottom = win.TestFrameExtension(w.NativeHandle()) })
+	return top, bottom
+}
+
 // titleButtonColor puts the pointer over a window control of a hidden
 // title bar and returns the color on the screen beside its glyph.
 func titleButtonColor(w *mygo.Window, name string) (r, g, b uint8, ok bool) {
@@ -201,6 +235,12 @@ func titleButtonColor(w *mygo.Window, name string) (r, g, b uint8, ok bool) {
 func composition(w *mygo.Window) (noRedirect, composed, supported bool) {
 	mygo.RunOnMain(func() { noRedirect, composed = win.TestComposed(w.NativeHandle()) })
 	return noRedirect, composed, true
+}
+
+// canCompose reports whether DirectComposition is available.
+func canCompose() (ok bool) {
+	mygo.RunOnMain(func() { ok = win.TestCanCompose() })
+	return ok
 }
 
 // loseComposition takes the device of DirectComposition away, as a draw
@@ -218,6 +258,8 @@ func failWebViews(n int) bool {
 
 // A Control-click is a secondary click on macOS only.
 func controlClick(*mygo.Window, float64, float64) bool { return false }
+
+func secondaryClickAsPrimary(*mygo.Window, float64, float64) bool { return false }
 
 // composeOver does what an input method that converts typed text again
 // does through IMM32: it settles the range it reconverts, then composes or
@@ -304,10 +346,17 @@ func choosePopupItem(label string) (ok bool) {
 	return ok
 }
 
+func popupItemEnabled(label string) (enabled, ok bool) {
+	mygo.RunOnMain(func() { enabled, ok = win.TestPopupItemEnabled(label) })
+	return enabled, ok
+}
+
 // Input methods keep the keys typed while they compose from the content
 // themselves here (GTK's filtering, IMM32's VK_PROCESSKEY), which a
 // composition the test makes up does not show.
 func pressKey(*mygo.Window, uint16, string) bool { return false }
+
+func pressKeyComposing(*mygo.Window, uint16, string, string, string) bool { return false }
 
 // dragFiles drags files from another application to (x, y) of a window of
 // native UI and drops them, as OLE does, waiting for the target to answer.
@@ -356,3 +405,100 @@ func panelStyles(w *mygo.Window) (tool, topmost, owned, supported bool) {
 	mygo.RunOnMain(func() { tool, topmost, owned = win.TestPanelStyles(w.NativeHandle()) })
 	return tool, topmost, owned, true
 }
+
+// throttlingOff reports whether the page of w, or of its first web view,
+// is set up to keep running while it can't be seen, and how many of the
+// settings that take the platform has.
+func throttlingOff(w *mygo.Window, webView bool) (off bool, settings int) {
+	mygo.RunOnMain(func() { off, settings = win.TestBackgroundThrottlingOff(w.NativeHandle(), webView) })
+	return off, settings
+}
+
+// WebView2 tells no capture.
+func mockCapture(*mygo.Window) bool { return false }
+
+// pageGestures reports whether a swipe navigates and a pinch zooms the page
+// of a window, or with webView 0 or more, of its web view of that index.
+func pageGestures(w *mygo.Window, webView int) (swipe, pinch, ok bool) {
+	mygo.RunOnMain(func() { swipe, pinch, ok = win.TestPageGestures(w.NativeHandle(), webView) })
+	return swipe, pinch, ok
+}
+
+// WebView2 takes touch input from Windows' pointer messages, which a test
+// can't send it.
+func pinchPage(*mygo.Window, int, float64, float64, ...float64) bool { return false }
+
+// pageMenusHooked tells that the tests can right-click a page and read
+// the menu it opens, through rightClickPage, pageMenu, choosePageMenuItem
+// and dismissPageMenu. A menu WebView2 draws itself can't be read: the
+// tests change theirs, which MyGo draws.
+const pageMenusHooked = true
+
+// rightClickPage right-clicks (x, y) in a window's page, with the
+// DevTools protocol's mouse events.
+func rightClickPage(w *mygo.Window, x, y float64) (ok bool) {
+	mygo.RunOnMain(func() { ok = win.TestRightClickPage(w.NativeHandle(), x, y) })
+	return ok
+}
+
+// pageMenu returns the labels of the items of the context menu MyGo
+// draws over a page, "-" for separators, and whether one is shown. The
+// modal loop of a menu runs the main thread's work.
+func pageMenu() (labels []string, shown bool) {
+	mygo.RunOnMain(func() { labels, shown = win.TestPageMenu() })
+	return labels, shown
+}
+
+// choosePageMenuItem chooses an item of that menu by its label.
+func choosePageMenuItem(label string) (ok bool) {
+	mygo.RunOnMain(func() { ok = win.TestChoosePageMenuItem(label) })
+	return ok
+}
+
+func dismissPageMenu() { mygo.RunOnMain(win.TestEndMenu) }
+
+// takeForeground brings a window to the foreground, after Alt pressed and
+// released when Windows refuses it: a process that sent the last input may
+// take the foreground.
+func takeForeground(w *mygo.Window) {
+	mygo.RunOnMain(func() {
+		if !win.TestForeground(w.NativeHandle()) {
+			win.TestPressKeys(0x12) // VK_MENU
+			win.TestForeground(w.NativeHandle())
+		}
+	})
+}
+
+// pressLetter presses the key of an uppercase letter, with Ctrl held when
+// cmd is set, like a keyboard, in the window brought to the foreground.
+func pressLetter(w *mygo.Window, letter byte, cmd bool) (ok bool) {
+	mygo.RunOnMain(func() {
+		if ok = win.TestForeground(w.NativeHandle()); !ok {
+			return
+		}
+		if cmd {
+			win.TestPressKeys(0x11, letter) // VK_CONTROL
+		} else {
+			win.TestPressKeys(letter)
+		}
+	})
+	return ok
+}
+
+func glassTint(*mygo.Window) (red, green, blue, alpha float64, ok bool) { return 0, 0, 0, 0, false }
+
+func nativeGlassSupported() bool { return false }
+
+func nativeGlass(*mygo.Window) (class string, frame [4]float64, style int, ok bool) {
+	return "", frame, 0, false
+}
+
+func nativeGlassTint(*mygo.Window) (red, green, blue, alpha float64) { return 0, 0, 0, 0 }
+
+func activateApp() {}
+
+func hitView(*mygo.Window, float64, float64) string { return "" }
+
+// Only X servers keep a keyboard's state for the tests after a test: see
+// left_behind_linux_test.go.
+func keyboardState() (state string, restore func()) { return "", func() {} }

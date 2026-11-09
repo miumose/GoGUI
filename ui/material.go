@@ -36,8 +36,19 @@ func (e *node) Material(m Material) *node {
 	return e
 }
 
-// Theme returns the theme of the view being painted.
-func (p *Painter) Theme() *Theme { return p.rt.c.theme }
+// Theme returns the theme of the element being painted: that of the
+// Themed around it, else the window's.
+func (p *Painter) Theme() *Theme {
+	if p.theme != nil {
+		return p.theme
+	}
+	return p.rt.c.theme
+}
+
+// Preferences returns the settings of the desktop that materials follow,
+// as Context.Preferences does: a material that reduces its translucency or
+// strengthens its contrast reads them here.
+func (p *Painter) Preferences() Preferences { return p.rt.preferences() }
 
 // EffectColor returns c as a parameter of an effect: straight RGBA from 0
 // to 1, its sRGB value, and wide, its color outside the sRGB gamut in

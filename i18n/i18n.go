@@ -16,16 +16,21 @@
 // the app shows (Locale). The data of CLDR is generated from a pinned
 // release (CLDRVersion) by `go generate`.
 //
-// FormatNumber and FormatDate write numbers, dates and times in the way of
-// a locale, by CLDR's data of the locales of its modern coverage, as ICU
-// and Intl write them; Months, Weekdays and DayPeriods give their names,
-// FirstWeekday and HourCycle a region's week and clock, and Autonym the
-// name of a language in itself. The data is linked into an app only when
-// it formats something.
+// FormatNumber and FormatDate write numbers, compact ones too ("1.2K"),
+// amounts of money ("$1,842.00", "1.842,00 €"), dates and times in the
+// way of a locale, and FormatDateRange ranges of
+// them ("Jan 5 – 9, 2026"), and FormatRelativeTime relative times
+// ("3 minutes ago", "tomorrow"), by CLDR's data of the locales of its modern
+// coverage, as ICU and Intl write them; Months, Weekdays and DayPeriods
+// give their names, FirstWeekday and HourCycle a region's week and clock,
+// and Autonym the name of a language in itself. The data is linked into
+// an app only when it formats something.
 package i18n
 
 import (
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"golang.org/x/text/language"
 )
@@ -36,12 +41,28 @@ import (
 // "sr_RS@latin" is "sr-Latn-RS") and the old codes of a language ("iw" is
 // "he", "in" is "id").
 func Normalize(locale string) string {
-	t, ok := parse(locale)
-	if !ok {
-		return ""
+	if tag, ok := normalized.Load(locale); ok {
+		return tag.(string)
 	}
-	return t.String()
+	var tag string
+	if t, ok := parse(locale); ok {
+		tag = t.String()
+	}
+	if cached.Add(1) <= maxNormalized {
+		normalized.Store(locale, tag)
+	}
+	return tag
 }
+
+// normalized caches Normalize, which formatting calls for every message,
+// for the first maxNormalized locales asked for: an app normalizing what
+// pages or users send would keep every string otherwise.
+var (
+	normalized sync.Map // string -> string
+	cached     atomic.Int64
+)
+
+const maxNormalized = 256
 
 // parse reads locale as Normalize does.
 func parse(locale string) (language.Tag, bool) {

@@ -114,9 +114,10 @@ func (e *node) layoutInput(cw, ch float32) {
 	}
 	// Text narrower than the box goes where TextAlign puts it: Start is
 	// the right of an input laid out right to left, whatever its text, as
-	// that of Text.
+	// that of Text. Its last column stays for the caret, as where the text
+	// scrolls: a caret on the box's right edge would be clipped away.
 	rtl := e.rtl()
-	if room := cw - l.Width; room > 0 {
+	if room := cw - l.Width - 1; room > 0 {
 		switch align := e.resolvedText().align; {
 		case align == Center:
 			ed.originX += room / 2
@@ -154,7 +155,7 @@ func (e *node) placeholderParams(width float32) text.Params {
 func (e *node) paintInput(p *Painter) {
 	ed := e.st.editor
 	l := ed.layout
-	t := e.c.theme
+	t := p.Theme()
 	if l == nil && ed.area == nil {
 		return
 	}
@@ -167,8 +168,12 @@ func (e *node) paintInput(p *Painter) {
 	ts := e.resolvedText()
 	if ed.buf.n == 0 && ed.compose == "" && ed.placeholder != "" {
 		pl := textSystem().Layout(e.placeholderParams(box.W))
+		color := t.TextMuted
+		if ed.placeholderColorSet {
+			color = ed.placeholderColor
+		}
 		// The placeholder aligns itself in the content box, as its layout has the box's width.
-		p.textLayout(pl, e.x+e.contentX(), oy, t.TextMuted, ts, nil)
+		p.textLayout(pl, e.x+e.contentX(), oy, color, ts, nil)
 	}
 	if ed.area != nil {
 		ed.area.paint(e, p, e.x+ed.originX, e.y+ed.originY)
@@ -200,11 +205,12 @@ func (e *node) paintInput(p *Painter) {
 		rt := e.c.rt
 		phase := e.c.now.Sub(rt.blinkStart)
 		const blink = 530 * time.Millisecond
-		if (phase/blink)%2 == 0 {
+		if (phase/blink)%2 == 0 && ed.caretWidth > 0 {
 			x, y, h := l.CaretAt(text.CaretPosition{Index: ed.displayIndex(ed.caret) + ed.composeCaret, Affinity: ed.caretAffinity})
-			p.add(scene.Op{Kind: scene.OpFill, Rect: p.snap(Rect{ox + x, oy + y, 0, h}), Color: t.Accent.scene(), Wide: p.wide(t.Accent, Color{}, Color{}), Opacity: p.opacity})
+			caret := ts.caretColor(t)
+			p.add(scene.Op{Kind: scene.OpFill, Rect: p.snap(Rect{ox + x, oy + y, 0, h}), Color: caret.scene(), Wide: p.wide(caret, Color{}, Color{}), Opacity: p.opacity})
 			op := &p.s.Ops[len(p.s.Ops)-1]
-			op.Rect.W = max(round(p.scale), 1)
+			op.Rect.W = max(round(ed.caretWidth*p.scale), 1)
 		}
 		if phase < 30*time.Second {
 			e.c.After(blink - phase%blink)

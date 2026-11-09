@@ -57,6 +57,9 @@ func writeBundle(c *Config, dir, bin string, icns []byte, car *assetCatalog, res
 	if err := copyResources(res, filepath.Join(contents, "Resources")); err != nil {
 		return "", err
 	}
+	if err := installNative(c, app); err != nil {
+		return "", err
+	}
 	langs, err := c.languages()
 	if err != nil {
 		return "", err
@@ -146,6 +149,26 @@ func appIcon(c *Config) ([]byte, error) {
 	return icns, nil
 }
 
+// bundleICNS returns the .icns of the bundle: the one actool rendered from
+// the .icon of car, macos.icon when it is an .icns, or the configured icon
+// rendered, or nil without any.
+func bundleICNS(c *Config, car *assetCatalog) ([]byte, error) {
+	if car != nil && car.icns != nil {
+		return car.icns, nil // the .icon's own rendering for older macOS
+	}
+	if src := c.MacOS.Icon; strings.EqualFold(filepath.Ext(src), ".icns") {
+		data, err := os.ReadFile(c.path(src))
+		if err == nil && !bytes.HasPrefix(data, []byte("icns")) {
+			err = errors.New("not an .icns file")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("macos.icon %s: %w", src, err)
+		}
+		return data, nil
+	}
+	return appIcon(c)
+}
+
 // assetCatalog is a compiled asset catalog, Assets.car, whose app icon is
 // named AppIcon, with the .icns that actool rendered from the same icon
 // (nil for an Assets.car of the configuration).
@@ -156,10 +179,10 @@ type assetCatalog struct {
 // appCatalog returns the asset catalog of macos.icon, or nil without one: an
 // Assets.car as it is, or an Icon Composer .icon compiled with actool. A
 // .icon that cannot be compiled, off macOS or without Xcode, leaves the app
-// with its .icns.
+// with its .icns. An .icns is no catalog: bundleICNS takes it.
 func appCatalog(c *Config) (*assetCatalog, error) {
 	src := c.MacOS.Icon
-	if src == "" {
+	if src == "" || strings.EqualFold(filepath.Ext(src), ".icns") {
 		return nil, nil
 	}
 	if !strings.EqualFold(filepath.Ext(src), ".icon") {
@@ -284,6 +307,11 @@ func infoPlist(c *Config, executable, icon, iconName string) []byte {
 		}
 		d["CFBundleURLTypes"] = []any{map[string]any{"CFBundleURLName": c.Identifier, "CFBundleURLSchemes": schemes}}
 	}
+	if c.native != nil {
+		for k, v := range c.native.info {
+			d[k] = v // the native modules' keys
+		}
+	}
 	for k, v := range c.MacOS.InfoPlist {
 		d[k] = v // the app's own keys win
 	}
@@ -380,9 +408,12 @@ func codesign(c *Config, path, identity string, production bool) error {
 	if err := signNestedCode(c, path, identity, production); err != nil {
 		return err
 	}
-	entitlements := ""
-	if c.MacOS.Entitlements != "" {
-		entitlements = c.path(c.MacOS.Entitlements)
+	entitlements, err := nativeEntitlements(c, filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if entitlements != "" && c.native != nil && len(c.native.entitlements) > 0 {
+		defer os.Remove(entitlements)
 	}
 	out, err := exec.Command("codesign", codesignArgs(path, identity, entitlements, production)...).CombinedOutput()
 	if err != nil {
@@ -403,7 +434,7 @@ func replacePath(src, dst string) error {
 			return err
 		}
 	}
-	if err := os.Rename(src, dst); err != nil {
+	if err := renamePackageStage(src, dst); err != nil {
 		if old != "" {
 			_ = os.Rename(old, dst)
 		}

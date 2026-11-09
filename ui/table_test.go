@@ -145,6 +145,101 @@ func TestTableReorder(t *testing.T) {
 	if got := s.Columns.Order; got[0] != "Name" {
 		t.Errorf("moved past a fixed column: %q", got)
 	}
+	// The release's own move moves the column too, and is no click.
+	x = float32(header(t, tt, "Kind").X + 20)
+	tt.Press(x, y)
+	tt.Move(x-5, y)
+	tt.Move(x-20, y)
+	tt.Release(x-60, y)
+	if got := s.Columns.Order; got[1] != "Kind" || got[2] != "Size" {
+		t.Errorf("Kind let go past the middle of Size: %q", got)
+	}
+	if sort.Column != "" {
+		t.Errorf("dragging the header sorted by %q", sort.Column)
+	}
+}
+
+// Changed reports a column moved or resized once the user lets go, when
+// the layout is new, and a column fitted to its cells, not as the pointer
+// moves: the app saves ListState.Columns once per gesture.
+func TestTableColumnsChanged(t *testing.T) {
+	s := ListState{}
+	cols := []TableColumn{{Title: "Name"}, {Title: "Kind", Width: 100}, {Title: "Size", Width: 80}}
+	names := []string{"a.txt"}
+	changes := 0
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Fill().Padding(10).Children(func() {
+			if coreTable(c, &s, cols, len(names), func(row, col int) {
+				coreText(c, []string{names[row], "Document", "1 KB"}[col]).SingleLine()
+			}).Grow(1).Changed() {
+				changes++
+			}
+		})
+	}, 500, 300)
+	expect := func(n int, what string) {
+		t.Helper()
+		if changes != n {
+			t.Fatalf("%s: Changed reported %d times, want %d (%+v)", what, changes, n, s.Columns)
+		}
+	}
+	kind := header(t, tt, "Kind")
+	y := float32(kind.Y + kind.H/2)
+
+	// Resizing Kind by its edge: reported on release only.
+	edge := float32(kind.X+kind.W) - 2
+	tt.Press(edge, y)
+	tt.Move(edge+10, y)
+	tt.Move(edge+30, y)
+	expect(0, "resizing, held")
+	tt.Release(edge+30, y)
+	expect(1, "resized")
+	if w := s.Columns.Widths["Kind"]; w != 130 {
+		t.Fatalf("Kind is %v wide", w)
+	}
+	// A press on the edge that comes back where it started changes nothing.
+	edge += 30
+	tt.Press(edge, y)
+	tt.Move(edge+20, y)
+	tt.Move(edge, y)
+	tt.Release(edge, y)
+	expect(1, "resized and back")
+
+	// A double click on the edge fits the column to its cells: one change,
+	// and none for a column already fitted.
+	tt.ClickAt(edge, y)
+	tt.ClickAt(edge, y)
+	expect(2, "fitted")
+	kind = header(t, tt, "Kind")
+	edge = float32(kind.X+kind.W) - 2
+	tt.ClickAt(edge, y)
+	tt.ClickAt(edge, y)
+	expect(2, "fitted again")
+
+	// Moving Kind past Size: reported on release only.
+	x := float32(kind.X + 20)
+	tt.Press(x, y)
+	for _, d := range []float32{5, 20, 50, 60} {
+		tt.Move(x+d, y)
+	}
+	if got := s.Columns.Order; len(got) != 3 || got[2] != "Kind" {
+		t.Fatalf("the order while held: %q", got)
+	}
+	expect(2, "moving, held")
+	tt.Release(x+60, y)
+	expect(3, "moved")
+	// A drag that leaves the column where it was changes nothing.
+	x = float32(header(t, tt, "Kind").X + 20)
+	tt.Press(x, y)
+	tt.Move(x-5, y)
+	tt.Move(x-10, y)
+	tt.Release(x-10, y)
+	if got := s.Columns.Order; got[2] != "Kind" {
+		t.Fatalf("Kind moved: %q", got)
+	}
+	expect(3, "dragged in place")
+	// Nor does a click on a header that does not sort.
+	tt.Click("Size")
+	expect(3, "clicked")
 }
 
 // A column dragged past several others stays the one dragged: its header
@@ -163,6 +258,55 @@ func TestTableReorderFar(t *testing.T) {
 	tt.Release(x+180, y)
 	if got := s.Columns.Order; len(got) != 4 || got[1] != "Size" || got[2] != "Date" || got[3] != "Kind" {
 		t.Fatalf("the order after dragging Kind past Size and Date: %q", got)
+	}
+}
+
+// The last column sharing the room left ends at the table's end: its
+// header has no edge, as AppKit's. A last column with a width keeps its.
+func TestTableLastColumnEdge(t *testing.T) {
+	// edge reports whether the end of a column's header resizes it, its
+	// pointer moving there and dragging it 30 DIPs out.
+	edge := func(tt *Tester, s *ListState, title string, rtl bool) bool {
+		h := header(t, tt, title)
+		x, y, dx := float32(h.X+h.W)-2, float32(h.Y+h.H/2), float32(-30)
+		if rtl {
+			x, dx = float32(h.X)+2, 30
+		}
+		tt.Move(x, y)
+		cursor := tt.Cursor() == CursorResizeEW
+		before := header(t, tt, title).W
+		tt.Press(x, y)
+		tt.Move(x+dx, y)
+		tt.Release(x+dx, y)
+		after := header(t, tt, title).W
+		if cursor != (after != before) {
+			t.Errorf("%s: the resize pointer %v, but dragged from %v to %v", title, cursor, before, after)
+		}
+		return cursor
+	}
+	for _, rtl := range []bool{false, true} {
+		s := ListState{}
+		cols := []TableColumn{{Title: "Name", Width: 150}, {Title: "Kind", Width: 100}, {Title: "Size"}}
+		tt := coreNewTester(tableView(&s, cols, []string{"a.txt"}), 500, 300)
+		if rtl {
+			tt.SetDirection(RightToLeft)
+		}
+		if edge(tt, &s, "Size", rtl) {
+			t.Errorf("rtl %v: the last column, sharing the room left, has an edge", rtl)
+		}
+		if _, ok := s.Columns.Widths["Size"]; ok {
+			t.Errorf("rtl %v: the last column took a width: %v", rtl, s.Columns.Widths)
+		}
+		if !edge(tt, &s, "Kind", rtl) {
+			t.Errorf("rtl %v: a column with a width before it has no edge", rtl)
+		}
+		// Moved before the others, it has its edge back, and the last one,
+		// with a width, keeps its own.
+		s.Columns.Order = []string{"Size", "Name", "Kind"}
+		tt.Frame()
+		if !edge(tt, &s, "Size", rtl) || !edge(tt, &s, "Kind", rtl) {
+			t.Errorf("rtl %v: moved first, Size or the last column, Kind, has no edge", rtl)
+		}
 	}
 }
 
@@ -516,5 +660,39 @@ func TestTableCellMenu(t *testing.T) {
 	tt.RightClickAt(r.X+2, r.Y+r.H/2)
 	if m := tt.Menu(); m != nil || gotRow != 1 || gotCol != 0 {
 		t.Fatalf("a menu built without items opened: %q (row %d, col %d)", m, gotRow, gotCol)
+	}
+}
+
+// HeaderCell gets each column's header cell as the table builds it: what
+// it builds goes in the cell after the title, and col is the column's
+// index in the columns given to Table.
+func TestTableHeaderCell(t *testing.T) {
+	hovered := -1
+	s := ListState{}
+	cols := []TableColumn{{Title: "Name"}, {Title: "Kind", Width: 100}, {Title: "Size", Width: 80}}
+	tt := coreNewTester(func(c *context) {
+		s.HeaderCell = func(cell Element, col int) {
+			coreTextf(c, "mark %d", col)
+			if cell.Hovered() {
+				hovered = col
+			}
+		}
+		coreColumn(c).Fill().Padding(10).Children(func() {
+			coreTable(c, &s, cols, 1, func(row, col int) { coreText(c, "a.txt") }).Grow(1)
+		})
+	}, 500, 300)
+	if !tt.HasText("mark 0") || !tt.HasText("mark 2") {
+		t.Fatalf("marks: %q", tt.Texts())
+	}
+	name, _ := tt.Find("Name")
+	mark, _ := tt.Find("mark 0")
+	if mark.X < name.X+name.W || mark.Y > name.Y+name.H {
+		t.Errorf("the mark at %+v, not after the title at %+v", mark, name)
+	}
+	size, _ := tt.Find("Size")
+	tt.Move(size.X+2, size.Y+size.H/2)
+	tt.Frame()
+	if hovered != 2 {
+		t.Fatalf("hovered %d", hovered)
 	}
 }

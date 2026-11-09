@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -440,6 +441,8 @@ func TestRecycledStateIsFresh(t *testing.T) {
 	if !gone[a] {
 		t.Fatal("a's state is not free")
 	}
+	// Away from where b shows, which would hover, building it again.
+	tt.Move(150, 150)
 	key = "b"
 	tt.Frame()
 	if !gone[st] {
@@ -549,5 +552,130 @@ func TestHoverWhilePressed(t *testing.T) {
 	tt.Frame()
 	if removes != 1 {
 		t.Errorf("%d clicks of the button, released away from it", removes)
+	}
+}
+
+// TestHoverFollowsLayout checks that what the frame moves under a pointer
+// standing still hovers, with no event from the pointer: a row removed,
+// the one taking its place hovers (#585).
+func TestHoverFollowsLayout(t *testing.T) {
+	items := []int{1, 2, 3}
+	hovered := map[int]bool{}
+	tt := coreNewTester(func(c *context) {
+		remove := -1
+		clear(hovered)
+		coreColumn(c).Children(func() {
+			for i, id := range items {
+				row := coreRow(c).Key(id).Size(200, 40)
+				hovered[id] = row.Hovered()
+				row.Children(func() {
+					coreText(c, fmt.Sprint("Item ", id)).Grow(1)
+					if hovered[id] && coreButton(c, fmt.Sprint("Delete ", id)).Cursor(CursorPointer).Clicked() {
+						remove = i
+					}
+				})
+			}
+		})
+		if remove >= 0 {
+			items = slices.Delete(items, remove, remove+1)
+			c.Invalidate()
+		}
+	}, 300, 200)
+	tt.Move(150, 20)
+	r, ok := tt.Find("Delete 1")
+	if !ok {
+		t.Fatalf("no button on the hovered row; texts %q", tt.Texts())
+	}
+	tt.ClickAt(r.X+r.W/2, r.Y+r.H/2)
+	if len(items) != 2 || items[0] != 2 {
+		t.Fatalf("items %v after the click", items)
+	}
+	if !hovered[2] || !tt.HasText("Delete 2") {
+		t.Error("the row moved under the pointer does not hover")
+	}
+	if tt.Cursor() != CursorPointer {
+		t.Errorf("cursor %v over the button moved under the pointer", tt.Cursor())
+	}
+}
+
+// TestHoverFollowsScroll checks that the frame scrolling a list under a
+// pointer standing still shows the row now under the pointer hovering, in
+// what it paints and in what it builds, rather than the row that was
+// there, and that no frame follows only to show it (#1508).
+func TestHoverFollowsScroll(t *testing.T) {
+	const rowH = 24
+	selected := 0
+	s := ListState{Selected: &selected, Label: func(i int) string { return fmt.Sprint("Row ", i) }}
+	var list *state
+	built := map[int]bool{} // the rows built hovering, as content reading it does
+	tt := coreNewTester(func(c *context) {
+		clear(built)
+		list = coreList(c, &s, 300, func(i int) {
+			r := coreRow(c).Height(rowH).FillWidth().Padding(4)
+			if r.Hovered() {
+				built[i] = true
+			}
+			r.Children(func() { coreText(c, fmt.Sprint("Row ", i)) })
+		}).Fill().st
+	}, 300, 400)
+	const x, y = 250, 110
+	tt.Move(x, y)
+	img := tt.Image()
+	at := func(y float32) [4]uint8 {
+		c := img.RGBAAt(x, int(y))
+		return [4]uint8{c.R, c.G, c.B, c.A}
+	}
+	if r, ok := tt.Find("Row 4"); !ok || r.Y != 4*rowH {
+		t.Fatalf("Row 4 at %v (%v)", r, ok)
+	}
+	hover, plain := at(y), at(y+5*rowH)
+	if hover == plain {
+		t.Fatalf("the hovered row paints as the others, %v", hover)
+	}
+	for _, step := range []struct {
+		name string
+		dys  []float64
+		// far scrolls past the rows the last frame laid out: the frame
+		// paints the row under the pointer hovering, and builds it so in
+		// the next.
+		far bool
+	}{
+		{"a row", []float64{rowH}, false},
+		{"part of a row", []float64{10}, false},
+		{"moves in one frame", []float64{4, 14, 24}, false},
+		{"back", []float64{-30}, false},
+		{"a jump", []float64{600}, true},
+	} {
+		was := int((y + float32(list.scrollY)) / rowH)
+		for _, dy := range step.dys {
+			tt.rt.event(platform.SurfaceEvent{Kind: platform.PointerScroll, X: x, Y: y, DY: dy, Precise: true})
+		}
+		// The one frame that shows the scroll.
+		tt.h.requested.Store(false)
+		tt.rt.runFrame()
+		img = tt.Image()
+		sy := float32(list.scrollY)
+		now := int((y + sy) / rowH)
+		if now == was {
+			t.Fatalf("%s: row %d stays under the pointer", step.name, now)
+		}
+		mid := func(i int) float32 { return float32(i)*rowH - sy + rowH/2 }
+		if got := at(mid(now)); got != hover {
+			t.Errorf("%s: row %d under the pointer paints %v, not hovering (%v)", step.name, now, got, hover)
+		}
+		if m := mid(was); m >= 0 && m < 400 {
+			if got := at(m); got != plain {
+				t.Errorf("%s: row %d the pointer left paints %v, still hovering (%v)", step.name, was, got, plain)
+			}
+		}
+		if step.far {
+			tt.Frame()
+		} else if tt.FramePending() {
+			t.Errorf("%s: a frame follows the scroll's", step.name)
+		}
+		if !built[now] || len(built) != 1 {
+			t.Errorf("%s: rows %v built hovering, row %d under the pointer", step.name, built, now)
+		}
+		tt.Frame()
 	}
 }

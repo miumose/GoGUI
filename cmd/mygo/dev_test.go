@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -44,6 +46,40 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	case "exit":
 		os.Exit(3)
+	case "relaunch":
+		// Like an app whose App.Relaunch passed arguments (devRelaunch in
+		// package mygo): it writes them, each ended with NUL, and exits.
+		var b []byte
+		for _, a := range []string{"--reason", "a b", ""} {
+			b = append(append(b, a...), 0)
+		}
+		if os.WriteFile(os.Getenv("MYGO_DEV_RELAUNCH"), b, 0o600) != nil {
+			os.Exit(2)
+		}
+		os.Exit(devRelaunchCode)
+	case "spawn-output-child":
+		child := fakeChild(os.Args[0], "hold-output")
+		switch os.Getenv("MYGO_FAKE_OUTPUT") {
+		case "stdout":
+			child.Stdout = os.Stdout
+		case "stderr":
+			child.Stderr = os.Stderr
+		case "both":
+			child.Stdout, child.Stderr = os.Stdout, os.Stderr
+		}
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	case "hold-output":
+		conn, err := net.Dial("tcp", os.Getenv("MYGO_FAKE_OUTPUT_ADDRESS"))
+		if err != nil {
+			os.Exit(2)
+		}
+		// Stay alive, holding inherited output open, until the test ends.
+		_, _ = io.Copy(io.Discard, conn)
+		conn.Close()
+		os.Exit(0)
 
 	case "hang":
 		signal.Ignore(syscall.SIGTERM)
@@ -119,6 +155,77 @@ func TestDevLaunch(t *testing.T) {
 	p.stop()
 	if p.err == nil {
 		t.Error("a build killed exited cleanly")
+	}
+}
+
+// TestDevRelaunchArgs: a build that mygo.App.Relaunch asks to start again
+// with arguments is started with them, once.
+func TestDevRelaunchArgs(t *testing.T) {
+	s := &devSession{root: t.TempDir()}
+	t.Setenv("MYGO_FAKE_APP", "relaunch")
+	p, err := s.launch(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait.For(t, "the build to exit", p.done)
+	var exit *exec.ExitError
+	if !errors.As(p.err, &exit) || exit.ExitCode() != devRelaunchCode {
+		t.Fatalf("exit: %v", p.err)
+	}
+	args := s.takeRelaunchArgs()
+	if want := []string{"--reason", "a b", ""}; !slices.Equal(args, want) {
+		t.Errorf("relaunch arguments %q, want %q", args, want)
+	}
+	if again := s.takeRelaunchArgs(); again != nil {
+		t.Errorf("taken twice: %q", again)
+	}
+	t.Setenv("MYGO_FAKE_APP", "exit")
+	if p, err = s.launch(os.Args[0], args...); err != nil {
+		t.Fatal(err)
+	}
+	wait.For(t, "the build to exit", p.done)
+	if !slices.Equal(p.cmd.Args[1:], args) {
+		t.Errorf("started with %q, want %q", p.cmd.Args[1:], args)
+	}
+}
+
+// A child can outlive the app and keep either or both output pipes open.
+// Waiting for the app must still finish without waiting for that child.
+func TestDevLaunchInheritedOutput(t *testing.T) {
+	for _, output := range []string{"none", "stdout", "stderr", "both"} {
+		t.Run(output, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			t.Setenv("MYGO_FAKE_APP", "spawn-output-child")
+			t.Setenv("MYGO_FAKE_OUTPUT", output)
+			t.Setenv("MYGO_FAKE_OUTPUT_ADDRESS", ln.Addr().String())
+			type accepted struct {
+				conn net.Conn
+				err  error
+			}
+			connected := make(chan accepted, 1)
+			go func() {
+				conn, err := ln.Accept()
+				connected <- accepted{conn, err}
+			}()
+			s := &devSession{root: t.TempDir()}
+			p, err := s.launch(os.Args[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			child := wait.For(t, "the child to connect", connected)
+			if child.err != nil {
+				t.Fatal(child.err)
+			}
+			defer child.conn.Close()
+			wait.For(t, "the app's exit to be reported while its child holds output open", p.done)
+			if p.err != nil {
+				t.Fatalf("app exit: %v", p.err)
+			}
+		})
 	}
 }
 
@@ -390,5 +497,47 @@ func TestDevConfig(t *testing.T) {
 	d := devConfig(c)
 	if d.Name != "Todo Dev" || d.Identifier != "dev.mygo.todo.dev" || c.Name != "Todo" {
 		t.Errorf("devConfig = %q %q (original %q)", d.Name, d.Identifier, c.Name)
+	}
+}
+
+// The development app wears the icon's -dev sibling, when it exists, which
+// does not ship among the resources.
+func TestDevIcon(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		"mygo.json":          `{"name": "Todo"}`,
+		"resources/icon.png": string(defaultIcon()),
+	})
+	c, err := loadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := devConfig(c); d.Icon != c.Icon {
+		t.Errorf("without icon-dev.png, the dev app's icon is %q, want the app's %q", d.Icon, c.Icon)
+	}
+	writeFiles(t, dir, map[string]string{"resources/icon-dev.png": string(defaultIcon())})
+	if d, want := devConfig(c), filepath.Join("resources", "icon-dev.png"); d.Icon != want || c.Icon == want {
+		t.Errorf("dev icon %q (the app's %q), want %q", d.Icon, c.Icon, want)
+	}
+	list, err := c.resources("darwin", "arm64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range list {
+		if r.name == "icon-dev.png" {
+			t.Error("the dev icon ships among the resources")
+		}
+	}
+	// Beside an icon the configuration names, too.
+	writeFiles(t, dir, map[string]string{
+		"mygo.json":        `{"name": "Todo", "icon": "art/logo.png"}`,
+		"art/logo.png":     string(defaultIcon()),
+		"art/logo-dev.png": string(defaultIcon()),
+	})
+	if c, err = loadConfig(dir); err != nil {
+		t.Fatal(err)
+	}
+	if d := devConfig(c); d.Icon != "art/logo-dev.png" {
+		t.Errorf("dev icon %q, want art/logo-dev.png", d.Icon)
 	}
 }

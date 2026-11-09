@@ -33,7 +33,7 @@ func newHarness(t *testing.T, opts Options) *harness {
 	saved := []func(){
 		func(e func() bool) func() { return func() { enabled = e } }(enabled),
 		func(c func(context.Context) (*release, error)) func() { return func() { check = c } }(check),
-		func(r func()) func() { return func() { relaunch = r } }(relaunch),
+		func(r func(...string)) func() { return func() { relaunch = r } }(relaunch),
 		func(v func() string) func() { return func() { appVersion = v } }(appVersion),
 		func(l func() string) func() { return func() { locale = l } }(locale),
 		func(d func() (string, error)) func() { return func() { stateDir = d } }(stateDir),
@@ -50,7 +50,7 @@ func newHarness(t *testing.T, opts Options) *harness {
 		h.checks.Add(1)
 		return h.result(ctx)
 	}
-	relaunch = func() { h.relaunches.Add(1) }
+	relaunch = func(...string) { h.relaunches.Add(1) }
 	appVersion = func() string { return "1.0.0" }
 	locale = func() string { return "en-US" }
 	stateDir = func() (string, error) { return h.dir, nil }
@@ -220,6 +220,44 @@ func TestInstallAndRelaunch(t *testing.T) {
 	}
 	if h.relaunches.Load() != 1 {
 		t.Error("Later relaunched")
+	}
+}
+
+// A window keeps the language it opened in; after the app's language
+// changes, the next window and the menu item take the new one.
+func TestLanguageChange(t *testing.T) {
+	h := newHarness(t, Options{})
+	proceed := make(chan struct{})
+	h.result = func(context.Context) (*release, error) {
+		return newRelease("2.0.0", func(ctx context.Context, progress func(int64, int64)) error {
+			<-proceed
+			return nil
+		}), nil
+	}
+	done := h.begin(true)
+	s := h.shown()
+	v := waitView(t, s, "A new version of")
+	s.Respond(v.Prompt, actionInstall, false)
+	waitView(t, s, "Downloading update…")
+	locale = func() string { return "zh-Hans" }
+	close(proceed)
+	v = waitView(t, s, "Ready to Relaunch")
+	if got := s.Texts(); got.Title != "Software Update" {
+		t.Errorf("texts of the open window: %+v", got)
+	}
+	s.Respond(v.Prompt, actionLater, false)
+	waitDone(t, done)
+
+	done = h.begin(true)
+	s = h.shown()
+	v = waitView(t, s, "可以重新启动了")
+	if got := s.Texts(); got.Title != "软件更新" {
+		t.Errorf("texts of the next window: %+v", got)
+	}
+	s.Respond(v.Prompt, actionLater, false)
+	waitDone(t, done)
+	if got := h.u.text().MenuItem; got != "检查更新…" {
+		t.Errorf("menu item %q", got)
 	}
 }
 
@@ -484,6 +522,65 @@ func TestOnChange(t *testing.T) {
 	told(false, "a function removed")
 }
 
+func TestOnInstalled(t *testing.T) {
+	h := newHarness(t, Options{})
+	active.Store(h.u)
+	t.Cleanup(func() { active.Store(nil) })
+	installs := make(chan struct{}, 10)
+	off := OnInstalled(func() { installs <- struct{}{} })
+	told := func(want int, what string) {
+		t.Helper()
+		for range want {
+			select {
+			case <-installs:
+			case <-time.After(wait.Guard):
+				t.Fatalf("%s: not told", what)
+			}
+		}
+		// The calls run in a goroutine of their own: a call that should
+		// not happen may come later, and then the next count sees it.
+		if len(installs) > 0 {
+			t.Errorf("%s: told %d more times", what, len(installs))
+		}
+	}
+
+	// A failed install does not count.
+	h.result = func(context.Context) (*release, error) {
+		return newRelease("2.0.0", func(context.Context, func(int64, int64)) error { return errors.New("disk full") }), nil
+	}
+	done := h.begin(true)
+	s := h.shown()
+	s.Respond(waitView(t, s, "A new version of").Prompt, actionInstall, false)
+	s.Respond(waitView(t, s, "Update Error").Prompt, actionOK, false)
+	waitDone(t, done)
+	told(0, "a failed install")
+
+	// Installed in the background.
+	h.result = func(context.Context) (*release, error) { return newRelease("2.0.0", nil), nil }
+	h.u.update(func(s *state) { s.AutomaticDownloads = true })
+	waitDone(t, h.begin(false))
+	told(1, "an automatic install")
+
+	// Only once: the update installed runs at the next launch.
+	done = h.begin(true)
+	s = h.shown()
+	s.Respond(waitView(t, s, "Ready to Relaunch").Prompt, actionLater, false)
+	waitDone(t, done)
+	told(0, "Ready to Relaunch again")
+
+	// Installed by the user, after a function was removed.
+	h.u.installed = nil
+	off2 := OnInstalled(func() { installs <- struct{}{} })
+	off()
+	done = h.begin(true)
+	s = h.shown()
+	s.Respond(waitView(t, s, "A new version of").Prompt, actionInstall, false)
+	s.Respond(waitView(t, s, "Ready to Relaunch").Prompt, actionLater, false)
+	waitDone(t, done)
+	told(1, "the user's install")
+	off2()
+}
+
 func TestSchedule(t *testing.T) {
 	h := newHarness(t, Options{})
 	h.u.running = true
@@ -495,6 +592,30 @@ func TestSchedule(t *testing.T) {
 	h.u.schedule()
 	if h.u.timer != nil {
 		t.Error("scheduled with automatic checks off")
+	}
+}
+
+func TestCheckAtLaunch(t *testing.T) {
+	h := newHarness(t, Options{})
+	defer func(w time.Duration) { firstCheckWait = w }(firstCheckWait)
+	firstCheckWait = time.Millisecond
+	// The last launch checked an hour ago; a version came out since.
+	h.u.update(func(s *state) { s.LastCheck = now().Add(-time.Hour) })
+	h.result = func(context.Context) (*release, error) { return newRelease("2.0.0", nil), nil }
+	h.u.running = true
+	h.u.schedule()
+	s := h.shown()
+	v := waitView(t, s, "A new version of")
+	s.Respond(v.Prompt, actionLater, false)
+	wait.Until(t, "the next check scheduled", func() bool {
+		h.u.mu.Lock()
+		defer h.u.mu.Unlock()
+		return h.u.session == nil && h.u.timer != nil
+	})
+	// Then an interval after it, not at once again.
+	time.Sleep(20 * time.Millisecond)
+	if n := h.checks.Load(); n != 1 {
+		t.Errorf("%d checks, want 1", n)
 	}
 }
 

@@ -534,3 +534,291 @@ func TestRichTextLinkOpensSafely(t *testing.T) {
 		t.Errorf("opened %q", got)
 	}
 }
+
+// TestRichTextLinkCanceledPress presses a link and has the system cancel
+// the press: the link opens only for a click.
+func TestRichTextLinkCanceledPress(t *testing.T) {
+	doc := NewDocument(TextOf(
+		Paragraph{Runs: []Run{{Text: "site", Attributes: Attributes{Link: "https://example.com"}}}},
+	))
+	tt, _ := richTester(t, doc)
+	var x, y float32
+	for y = 2; y < 40; y += 2 {
+		if tt.Move(10, y); tt.Cursor() == ui.CursorPointer {
+			x = 10
+			break
+		}
+	}
+	if x == 0 {
+		t.Fatal("no link under the pointer")
+	}
+	tt.Press(x, y)
+	tt.CancelPress()
+	if got := tt.OpenedURLs(); len(got) != 0 {
+		t.Fatalf("a canceled press opened %q", got)
+	}
+	tt.Advance(time.Second) // no double click
+	tt.ClickAt(x, y)
+	if got := tt.OpenedURLs(); !slices.Equal(got, []string{"https://example.com"}) {
+		t.Fatalf("a click opened %q", got)
+	}
+}
+
+// TestRichTextCJKWords deletes and moves by words in Chinese and
+// Japanese: a character at a time, as they have no spaces (#668).
+func TestRichTextCJKWords(t *testing.T) {
+	word := ui.Ctrl
+	if runtime.GOOS == "darwin" {
+		word = ui.Alt
+	}
+	doc := NewDocument(TextOf(Paragraph{Runs: []Run{{Text: "Go语言，今日は"}}}))
+	tt, _ := richTester(t, doc)
+	tt.Key(word, ui.KeyBackspace)
+	if got := doc.Text().String(); got != "Go语言，今日" {
+		t.Fatalf("word backspace left %q", got)
+	}
+	for _, want := range []int{6, 5, 3, 2, 0} {
+		tt.Key(word, ui.KeyLeft)
+		if a, c := doc.Selection(); a != want || c != want {
+			t.Fatalf("word left went to %d–%d, want %d", a, c, want)
+		}
+	}
+}
+
+// The scroll bar's thumb shows while the pointer is over the editor, as a
+// scroll container's does, and not otherwise.
+func TestScrollbarOnHover(t *testing.T) {
+	doc := NewDocument(NewText(strings.Repeat("line\n", 200)))
+	tt := ui.NewTester(func(c *ui.Context) { Editor(c, doc).Fill() }, 500, 400)
+	thumb := func() bool {
+		img := tt.Image()
+		s := img.Bounds().Dx() / 500
+		// Clear of the border's rounded corners.
+		for y := 10 * s; y < 390*s; y++ {
+			if img.RGBAAt(494*s, y) != img.RGBAAt(480*s, y) {
+				return true
+			}
+		}
+		return false
+	}
+	tt.Move(-10, -10)
+	tt.Frame()
+	if thumb() {
+		t.Fatal("the thumb shows with the pointer away")
+	}
+	tt.Move(250, 200)
+	tt.Frame()
+	if !thumb() {
+		t.Fatal("the thumb doesn't show with the pointer over the editor")
+	}
+	tt.Move(-10, -10)
+	tt.Frame()
+	if thumb() {
+		t.Fatal("the thumb stayed as the pointer left")
+	}
+}
+
+func TestAttachmentLinkBounds(t *testing.T) {
+	for _, readOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "editable", true: "read-only"}[readOnly], func(t *testing.T) {
+			var boxes [2]ui.Rect
+			var opened []string
+			text := NewText("before ")
+			for i, link := range []string{"first", "second"} {
+				text = text.Append(string(ObjectReplacement), Attributes{Link: link, Attachment: &Attachment{
+					Name: link, Width: 120, Height: 24,
+					Draw: func(_ *ui.Painter, r ui.Rect) { boxes[i] = r },
+				}})
+			}
+			text = text.Append(" after", Attributes{})
+			doc := NewDocument(text)
+			tt := ui.NewTester(func(c *ui.Context) {
+				EditorBase(c, doc, EditorOptions{ReadOnly: readOnly, OnLink: func(s string) { opened = append(opened, s) }}).Fill()
+			}, 500, 200)
+			tt.Frame()
+			for i, box := range boxes {
+				for _, dx := range []float32{1, 20, 60, 119} {
+					tt.Advance(time.Second)
+					x, y := box.X+dx, box.Y+box.H/2
+					tt.Move(x, y)
+					if tt.Cursor() != ui.CursorPointer {
+						t.Fatalf("attachment %d at %v has no pointer cursor", i, dx)
+					}
+					tt.ClickAt(x, y)
+					want := []string{"first", "second"}[i]
+					if len(opened) != 1 || opened[0] != want {
+						t.Fatalf("attachment %d at %v: opened %v", i, dx, opened)
+					}
+					opened = nil
+				}
+			}
+			for _, point := range []ui.Point{
+				{X: boxes[0].X - 1, Y: boxes[0].Y + 12},
+				{X: boxes[1].X + 121, Y: boxes[1].Y + 12},
+				{X: boxes[0].X + 100, Y: boxes[0].Y + 30},
+			} {
+				tt.Advance(time.Second)
+				tt.ClickAt(point.X, point.Y)
+				if len(opened) != 0 {
+					t.Fatalf("outside attachment at %+v opened %v", point, opened)
+				}
+			}
+			// A drag within one half still has the same nearest caret.
+			box := boxes[0]
+			tt.Advance(time.Second)
+			tt.Press(box.X+4, box.Y+12)
+			tt.Move(box.X+30, box.Y+12)
+			tt.Move(box.X+4, box.Y+12)
+			tt.Release(box.X+4, box.Y+12)
+			if len(opened) != 0 {
+				t.Fatal("drag returning to the press opened the attachment")
+			}
+			tt.Advance(time.Second)
+			tt.Press(box.X+4, box.Y+12)
+			tt.Move(box.X+116, box.Y+12)
+			tt.Release(box.X+116, box.Y+12)
+			a, z := doc.Selection()
+			if len(opened) != 0 || min(a, z) != 7 || max(a, z) != 8 {
+				t.Fatalf("drag: opened=%v selection=%d,%d", opened, a, z)
+			}
+			if doc.Text().PlainText() != text.PlainText() {
+				t.Fatal("pointer input changed the document")
+			}
+		})
+	}
+}
+
+// OnKey is asked first: a key it takes does nothing in the editor, and one it lets go is the editor's as before.
+func TestRichTextOnKey(t *testing.T) {
+	doc := NewDocument(NewText("one\ntwo"))
+	var asked []ui.Key
+	tt := ui.NewTester(func(c *ui.Context) {
+		Editor(c, doc, EditorOptions{OnKey: func(k ui.Key, _ ui.Modifiers) bool {
+			asked = append(asked, k)
+			return k == ui.KeyDown || k == ui.KeyEnter
+		}}).Fill()
+	}, 500, 400)
+	tt.Press(10, 10)
+	tt.Release(10, 10)
+	doc.SetSelection(1, 1)
+	tt.Frame()
+	tt.Key(0, ui.KeyDown)
+	tt.Key(0, ui.KeyEnter)
+	if _, c := doc.Selection(); c != 1 || doc.Text().String() != "one\ntwo" {
+		t.Fatalf("a key taken by OnKey moved or changed the text: caret %d, %q", c, doc.Text().String())
+	}
+	tt.Key(0, ui.KeyRight)
+	if _, c := doc.Selection(); c != 2 {
+		t.Fatalf("a key let go is not the editor's: caret %d", c)
+	}
+	if len(asked) != 3 {
+		t.Fatalf("asked about %v", asked)
+	}
+	// what OnKey does to the document is kept: the editor does not give its own selection back over it
+	tt2 := ui.NewTester(func(c *ui.Context) {
+		Editor(c, doc, EditorOptions{OnKey: func(k ui.Key, _ ui.Modifiers) bool {
+			if k == ui.KeyEnter {
+				doc.Edit(func(ed *Edit) { ed.Replace(0, 3, NewText("ONE")); ed.Select(1, 1) })
+				return true
+			}
+			return false
+		}}).Fill()
+	}, 500, 400)
+	tt2.Press(10, 10)
+	tt2.Release(10, 10)
+	doc.SetSelection(3, 3)
+	tt2.Frame()
+	tt2.Key(0, ui.KeyEnter)
+	tt2.Frame()
+	if _, c := doc.Selection(); c != 1 || doc.Text().String() != "ONE\ntwo" {
+		t.Fatalf("what OnKey did was undone: caret %d, %q", c, doc.Text().String())
+	}
+}
+
+// Spans is given each paragraph's spans to draw them otherwise, its text the same; the layouts it made are kept until
+// SpansVersion changes.
+func TestRichTextSpans(t *testing.T) {
+	doc := NewDocument(NewText("plain\ncolored"))
+	calls, ver, red := 0, 0, false
+	draw := func(c *ui.Context) {
+		opts := EditorOptions{SpansVersion: ver}
+		if red {
+			opts.Spans = func(_ int, st ParagraphStyle, spans []ui.Span) []ui.Span {
+				calls++
+				for i := range spans {
+					spans[i].Color = ui.RGB(220, 0, 0)
+					spans[i].LetterSpacing = 2
+				}
+				return spans
+			}
+		}
+		Editor(c, doc, opts).Fill()
+	}
+	tt := ui.NewTester(draw, 500, 300)
+	tt.Frame()
+	plain := bytes.Clone(tt.Image().Pix)
+	red = true
+	tt.Frame()
+	if calls == 0 || bytes.Equal(tt.Image().Pix, plain) {
+		t.Fatalf("the spans were not drawn otherwise: %d calls", calls)
+	}
+	was := calls
+	tt.Frame()
+	if calls != was {
+		t.Fatalf("laid out again with nothing changed: %d calls", calls-was)
+	}
+	ver++
+	tt.Frame()
+	if calls == was {
+		t.Fatal("not laid out again when the version changed")
+	}
+	if doc.Text().String() != "plain\ncolored" {
+		t.Fatal("the text changed")
+	}
+}
+
+// Menu builds the editor's context menu in place of its own: a right click shows the app's items, not the editor's.
+func TestRichTextMenu(t *testing.T) {
+	doc := NewDocument(NewText("some text"))
+	tt := ui.NewTester(func(c *ui.Context) {
+		Editor(c, doc, EditorOptions{Menu: func(m *ui.Menu) { m.Item("Ask the app") }}).Fill()
+	}, 500, 300)
+	tt.RightClickAt(40, 20)
+	if got := tt.Menu(); len(got) != 1 || got[0] != "Ask the app" {
+		t.Fatalf("the menu: %q", got)
+	}
+	plain := ui.NewTester(func(c *ui.Context) { Editor(c, NewDocument(NewText("some text"))).Fill() }, 500, 300)
+	plain.RightClickAt(40, 20)
+	if got := plain.Menu(); len(got) > 0 && got[0] == "Ask the app" {
+		t.Fatalf("without Menu, the app's item: %q", got)
+	}
+}
+
+func TestRichTextEditMenu(t *testing.T) {
+	doc := NewDocument(NewText("some text"))
+	tt := ui.NewTester(func(c *ui.Context) { Editor(c, doc).Fill() }, 500, 300)
+	tt.RightClickAt(40, 20)
+	if got := tt.Menu(); !slices.Contains(got, "Copy") || !slices.Contains(got, "Paste") || !slices.Contains(got, "Select All") {
+		t.Fatalf("the editor's own menu: %q", got)
+	}
+	if err := tt.ChooseMenuItem("Select All"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if a, z := doc.Selection(); min(a, z) != 0 || max(a, z) != len("some text") {
+		t.Fatalf("Select All selected %d…%d", a, z)
+	}
+
+	// EditItems puts the editor's commands in the app's own menu.
+	app := ui.NewTester(func(c *ui.Context) {
+		Editor(c, NewDocument(NewText("some text")), EditorOptions{Menu: func(m *ui.Menu) {
+			m.Item("Ask the app")
+			m.Separator()
+			m.EditItems()
+		}}).Fill()
+	}, 500, 300)
+	app.RightClickAt(40, 20)
+	if got := app.Menu(); len(got) < 3 || got[0] != "Ask the app" || !slices.Contains(got, "Copy") {
+		t.Fatalf("the app's menu with EditItems: %q", got)
+	}
+}

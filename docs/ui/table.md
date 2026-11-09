@@ -29,7 +29,7 @@ if ui.Table(c, &app.files, cols, len(files), func(row, col int) {
 The table takes the same `ListState` as a list, or `nil`, and takes the
 keyboard focus for it: with `Selected`, a click or the keys choose a row,
 with `Selection` several, and `Submitted` reports a double click or Enter;
-`Key`, `Label`, `Reorder` and the rest work as for a list. A row `Header`
+`Key`, `Label`, `Reorder`, `DragRows` and the rest work as for a list. A row `Header`
 names spans every column, which `cell` builds as column 0, and stays at the
 top while its section's rows scroll under it.
 
@@ -72,8 +72,26 @@ block's column IDs in the order shown, and `SelectColumns` chooses every row
 and a range of columns, for the app's own commands. `CellSelected(row, col)`
 tells a cell builder whether its cell is chosen, for text of its own color
 to show on the accent. A cell that reads its
-row's double click with `RowDoubleClicked` leaves the click to the row, so
-the block follows it.
+row's click with `RowClicked`, or its double click with `RowDoubleClicked`,
+leaves the click to the row, so the block follows it.
+
+`CellsStyle` paints the block in colors of its own rather than the accent,
+as a spreadsheet's two levels and stripes: `Cell` fills the block's cells,
+`CellText` colors their text, `Row` fills the rest of the rows chosen, and
+`Stripe` fills every other row. A zero color paints none. The cursor's
+border takes `CellText` in the block and `Cell` out of it, or the accent
+and its text where those are zero.
+
+```go
+t := c.Theme()
+app.grid.CellSelect = true
+app.grid.CellsStyle = ui.CellsStyle{
+	Cell:     t.Accent,
+	CellText: t.AccentText,
+	Row:      t.Accent.Alpha(0.12),
+	Stripe:   t.Text.Alpha(0.04),
+}
+```
 
 ```go
 cols := []ui.TableColumn{{Title: "#", RowHeader: true, Width: 48, Fixed: true}, {Title: "Name"}, {Title: "Size", Width: 90}}
@@ -105,7 +123,20 @@ The user arranges the columns, as in Finder:
 
 `ListState.Columns` keeps the order and the widths, by the columns' `ID`s
 (their titles by default): set it from saved settings to restore them, and
-save it as it changes.
+save it when the table's `Changed` reports it. `Columns` changes as the
+pointer moves, but `Changed` reports it once, as the user lets go of a header
+or an edge, when the order or a width is new, and once a double click fits a
+column to its cells, so the settings are written once per gesture:
+
+```go
+if ui.Table(c, &app.files, cols, len(files), cell).Grow(1).Changed() {
+	app.settings.Columns = app.files.Columns
+	app.saveSettings()
+}
+```
+
+With `Sort` or `SortBy` set too, `Changed` also reports a new sort: save
+both when it reports either.
 
 ## Sorting
 
@@ -157,6 +188,19 @@ app.files.HeaderMenu = func(m *ui.Menu, col int) {
 }
 ```
 
+## Header cells
+
+`ListState.HeaderCell` is called as the table builds each column's header
+cell, with the cell and the column's index, as `HeaderMenu`'s: what it
+builds goes in the cell after the title and the sort arrow, and it may
+give the cell a tooltip or a card of its own:
+
+```go
+app.files.HeaderCell = func(cell ui.Element, col int) {
+	cell.Tooltip(app.columnTypes[col])
+}
+```
+
 ## Cell menu
 
 `ListState.CellMenu` gives the cells a context menu over the whole cell,
@@ -191,7 +235,8 @@ ui.Table(c, &app.files, cols, len(files), func(row, col int) {
 
 Assistive technology sees a table, named by its `Label`, of rows named by
 the text inside them, each saying which of all the rows it is, with column
-headers that say the order the rows are sorted in. With `CellSelect`, the
-cells of the block say they are chosen.
+headers that say the order the rows are sorted in, and the cells of a
+`RowHeader` column naming their rows as row headers. With `CellSelect`,
+the cells of the block say they are chosen.
 
 For a tree of rows in columns, see [Outline](outline.md#in-columns).
